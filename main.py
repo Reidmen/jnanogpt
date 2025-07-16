@@ -17,7 +17,12 @@ def set_xla_flags_cpu(device_count: int = 8):
   os.environ["XLA_FLAGS"] = flags
   os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
-set_xla_flags_cpu(8)
+# Check for temporal flags
+if os.getenv("USE_GPU", False): 
+  set_xla_flags_gpu()
+else:
+  set_xla_flags_cpu(8)
+
 print(f"XLA flags: {os.environ.get('XLA_FLAGS', '')}")
 
 from functools import partial
@@ -57,7 +62,7 @@ class ModelConfig:
   dropout_rate: float = 0.1
   mlp_expansion: int = 4
   num_layers: int = 12
-  head_dim: int = 32  # 128
+  head_dim: int = 64  # 128
   vocab_size: int = 512
   causal_mask: bool = True
   max_seq_len: int = 64
@@ -146,7 +151,6 @@ def accumulated_gradients_scan(
   )
   grads = jax.tree_util.tree_map(lambda g: g / num_minbatches, grads)
   return grads, metrics
-
 
 def accumulate_gradients(
   state: TrainState,
@@ -324,7 +328,7 @@ if __name__ == "__main__":
 
   model_rgn, state_rng = jax.random.split(jax.random.PRNGKey(cfg.seed))
   init_input = batch.inputs[: (cfg.data.batch_size // cfg.optimizer.num_minibatches)]
-  model_init = model.init(model_rgn, init_input, None, train=False)
+  model_init = model.init(model_rgn, init_input, mask=None, train=False)
   # print(jax.tree_util.tree_map(jnp.shape, model_init))
   state = TrainState.create(
     apply_fn=model.apply, params=model_init["params"], tx=optimizer, rng=state_rng
@@ -350,5 +354,6 @@ if __name__ == "__main__":
 
 
 # to load tensorboard jupyter
+# Requires !pip install --upgrade --quiet tensorflow tensorboard_plugin_profile
 # %load_ext tensorboard
-# %tensorboard --logdir traces/single_gpu_transformer
+# %tensorboard --logdir=traces
