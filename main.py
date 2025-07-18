@@ -1,5 +1,6 @@
 import os, subprocess, sys
 
+
 def set_xla_flags_gpu():
   flags = os.environ.get("XLA_FLAGS", "")
   flags += (
@@ -11,14 +12,16 @@ def set_xla_flags_gpu():
   )
   os.environ["XLA_FLAGS"] = flags
 
+
 def set_xla_flags_cpu(device_count: int = 8):
   flags = os.environ.get("XLA_FLAGS", "")
   flags += f" --xla_force_host_platform_device_count={device_count}"
   os.environ["XLA_FLAGS"] = flags
   os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
+
 # Check for temporal flags
-if os.getenv("USE_GPU", False): 
+if os.getenv("USE_GPU", False):
   set_xla_flags_gpu()
 else:
   set_xla_flags_cpu(8)
@@ -45,6 +48,7 @@ Metrics = dict[str, tuple[jax.Array, ...]]
 def install_package(package: str) -> None:
   subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", package])
 
+
 # Configs
 static_compatible_dataclass = lambda cls: tree_util.register_static(dataclasses.dataclass(cls))
 
@@ -69,7 +73,7 @@ class ModelConfig:
   num_outputs: int = 512  # 2048
   dtype: jnp.dtype = jnp.bfloat16
   softmax_dtype: jnp.dtype = jnp.float32
-  scan_layers: bool = False 
+  scan_layers: bool = False
   remat: tuple[str, ...] = ("MLP", "Attention")
 
 
@@ -152,6 +156,7 @@ def accumulated_gradients_scan(
   grads = jax.tree_util.tree_map(lambda g: g / num_minbatches, grads)
   return grads, metrics
 
+
 def accumulate_gradients(
   state: TrainState,
   batch: Batch,
@@ -216,7 +221,7 @@ class AttentionBlock(nnx.Module):
 
   @nnx.compact
   def __call__(self, x: jax.Array) -> jax.Array:
-    hidden_dim = x.shape[-1] # x (batch_size, seq_len, head_dim)
+    hidden_dim = x.shape[-1]  # x (batch_size, seq_len, head_dim)
     x = nnx.LayerNorm(dtype=self.config.dtype, name="pre_norm")(x)
     num_heads = self.config.hidden_size // self.config.head_dim
     qkv = nnx.DenseGeneral(features=(num_heads, self.config.head_dim * 3), dtype=self.config.dtype, name="qkv")(x)
@@ -317,7 +322,7 @@ if __name__ == "__main__":
   # Alternative, use Muon optimizer
   # https://github.com/MoonshotAI/Kimi-K
   lr = optax.warmup_exponential_decay_schedule(
-      init_value=0.0, peak_value=cfg.optimizer.learning_date, warmup_steps=10, transition_steps=1, decay_rate=0.99
+    init_value=0.0, peak_value=cfg.optimizer.learning_date, warmup_steps=10, transition_steps=1, decay_rate=0.99
   )
   optimizer = optax.adam(learning_rate=lr)
 
@@ -330,9 +335,7 @@ if __name__ == "__main__":
   init_input = batch.inputs[: (cfg.data.batch_size // cfg.optimizer.num_minibatches)]
   model_init = model.init(model_rgn, init_input, mask=None, train=False)
   # print(jax.tree_util.tree_map(jnp.shape, model_init))
-  state = TrainState.create(
-    apply_fn=model.apply, params=model_init["params"], tx=optimizer, rng=state_rng
-  )
+  state = TrainState.create(apply_fn=model.apply, params=model_init["params"], tx=optimizer, rng=state_rng)
   print(f"Number of parameters: {get_num_params(state)}")
 
   _, metric_shapes = jax.eval_shape(train_step, state, batch, None, cfg)
