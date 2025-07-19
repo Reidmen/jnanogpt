@@ -4,7 +4,8 @@ This repository aims at replicating [modded-nangpt](https://github.com/KellerJor
 
 **TODO**
 
-- [ ] `basics` folder with relevant transformers implementations.
+- [x] `basics` folder with relevant transformers implementations.
+- [ ] include basics on data, pipeline and tensor parallelism. 
 - [ ] JAX version of `ref/train_gpt.py`. 
 - [ ] Timing it until sunset.
 
