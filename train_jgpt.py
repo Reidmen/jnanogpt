@@ -42,15 +42,16 @@ static_compatible_dataclass = lambda cls: tree_util.register_static(dataclasses.
 @static_compatible_dataclass
 class ModelConfig:
   block_size: int = 1024
-  vocab_size: int = 50304
+  vocab_size: int = 1024 * 8# 50304 
   num_layers: int = 12
   num_heads: int = 12
   num_embeds: int = 768
+  epsilon: float = 1e-5
   mlp_expansion_factor: int = 4
   dropout_rate: float = 0.1
   use_bias: bool = True
   dtype: jnp.dtype = jnp.bfloat16
-  deterministic: bool = False
+  deterministic: bool = True 
   use_proj_bias: bool = True
   remat: tuple[str,...] = ("Attn", "MLP") 
 
@@ -59,16 +60,17 @@ class SelfAttention(nnx.Module):
   cfg: ModelConfig
 
   @nnx.compact
-  def __call__(self, x: jax.Array, mask: jax.Array, deterministic: bool = False):
+  def __call__(self, x: jax.Array, mask: jax.Array):
     batch_size, seq_len, hidden_dim = x.shape
     assert hidden_dim % self.cfg.num_heads == 0
     head_dim = hidden_dim // self.cfg.num_heads
     qkv = nnx.Dense(features=3 * hidden_dim, use_bias=self.cfg.use_proj_bias, dtype=self.cfg.dtype, name="c_attn")(x)
-    qkv = qkv.reshape(batch_size, seq_len, 3 * self.cfg.num_heads, head_dim)
-    q, k, v = jnp.array_split(qkv, indices_or_sections=3, axis=2)
-    attn = jax.nn.dot_product_attention(q, k, v, bias=None)
-    x = nnx.Dense(features=seq_len, use_bias=self.cfg.use_proj_bias, dtype=self.cfg.dtype, name="c_proj")
-    x = nnx.Dropout(rate=self.cfg.dropout_rate, deterministic=self.cfg.deterministic)(attn)
+    qkv = qkv.reshape(batch_size, seq_len, 3 * self.cfg.num_heads, head_dim) 
+    q, k, v = jnp.array_split(qkv, indices_or_sections=3, axis=2) # (batch_size, seq_len, num_heads, head_dim)
+    attn = jax.nn.dot_product_attention(q, k, v, bias=None) # Add mask here
+    attn = attn.reshape((batch_size, seq_len, hidden_dim))
+    x = nnx.Dense(features=hidden_dim, use_bias=self.cfg.use_proj_bias, dtype=self.cfg.dtype, name="c_proj")(attn)
+    x = nnx.Dropout(rate=self.cfg.dropout_rate, deterministic=self.cfg.deterministic)(x)
     return x
 
 
@@ -77,7 +79,7 @@ class MLP(nnx.Module):
 
   @nnx.compact
   def __call__(self, x: jax.Array):
-    batch_size, seq_len, hidden_dim = x.shape
+    hidden_dim = x.shape[-1]
     x = nnx.Dense(
       features=self.cfg.mlp_expansion_factor * hidden_dim, dtype=self.cfg.dtype, use_bias=self.cfg.use_bias, name="c_fc"
     )(x)
@@ -92,7 +94,7 @@ class Block(nnx.Module):
 
   @nnx.compact
   def __call__(self, x: jax.Array, mask: jax.Array):
-    residual = x
+    residual = x # (batch_size, seq_len, hidden_dim)
     # Attention block
     x = nnx.LayerNorm(epsilon=self.cfg.epsilon, dtype=self.cfg.dtype, use_bias=self.cfg.use_bias)(x)
     attn_block = SelfAttention
@@ -102,7 +104,7 @@ class Block(nnx.Module):
     x = x + residual
     # MLP block
     mlp_block = MLP
-    if "MLP" in self.cfg.remal:
+    if "MLP" in self.cfg.remat:
       mlp_block = nnx.remat(mlp_block, prevent_cse=False)
     x = mlp_block(self.cfg)(x)
     return x
@@ -112,20 +114,24 @@ class GPTModel(nnx.Module):
   cfg: ModelConfig
 
   @nnx.compact
-  def __call__(self, idx: jax.Array):
+  def __call__(self, idx: jax.Array, train: bool):
     batch_size, seq_len = idx.shape
-    position = jnp.arange(0, seq_len)[:, None]
+    position = jnp.arange(0, seq_len)[None, :]
     attn_mask = nnx.make_causal_mask(idx, dtype=bool)
 
-    wte = nnx.Embed(self.cfg.vocab_size, self.cfg.num_embeds, dtype=self.cfg.dtype, name="wte")
-    wpe = nnx.Embed(self.cfg.block_size, self.cfg.num_embeds, dtype=self.cfg.dtype, name="wpe")
+    wte = nnx.Embed(
+      num_embeddings=self.cfg.vocab_size, features=self.cfg.num_embeds, dtype=self.cfg.dtype, name="wte"
+    ) # (vocab_size, embed_dim)
+    wpe = nnx.Embed(
+      num_embeddings=self.cfg.block_size, features=self.cfg.num_embeds, dtype=self.cfg.dtype, name="wpe"
+    ) # (vocab_size, embed_dim)
     token_embed = wte(idx)  # (batch_size, seq_len, num_embed)
-    position_embed = wpe(position)  # (1, seq_len, num_embeds)
-    x = nnx.Dropout(rate=self.cfg.dropout_rate)(token_embed + position_embed)
+    position_embed = wpe(position)  # (1, seq_len, num_embed)
+    x = nnx.Dropout(rate=self.cfg.dropout_rate, deterministic=not train)(token_embed + position_embed)
     for i in range(self.cfg.num_layers):
       x = Block(self.cfg, name=f"block_{i}")(x, attn_mask)
     x = nnx.LayerNorm(self.cfg.epsilon, dtype=self.cfg.dtype, use_bias=self.cfg.use_bias, name="ln_f")(x)
-    logits = wte(x).astype(self.cfg.dtype)
+    logits = wte.attend(x).astype(self.cfg.dtype)
     return logits
 
 
@@ -213,7 +219,7 @@ def train_step(state: TrainState, tokens: jnp.ndarray, dropout_key: jax.random.P
     loss = optax.softmax_cross_entropy_with_integer_labels(logits, Y).mean()
     return loss
 
-  # per-devie loss and grads
+  # per-device loss and grads
   loss, grads = jax.value_and_grad(_loss, has_aux=False)(state.params)
   grads = jax.lax.pmean(grads, axis_name="batch")
   loss = jax.lax.pmean(loss, axis_name="batch")
@@ -278,7 +284,7 @@ def get_dataset(
   seed: int | None = None,
 ) -> tf.data.Dataset:
   tf.random.set_seed(seed)
-  ile_ds = tf.data.Dataset.list_files(pattern, shuffle=bool(shuffle_buffer_size))
+  file_ds = tf.data.Dataset.list_files(pattern, shuffle=bool(shuffle_buffer_size))
   file_ds = file_ds.shard(jax.process_count(), jax.process_index())
   ds = tf.data.TFRecordDataset(file_ds, num_parallel_reads=tf.data.AUTOTUNE)
   feature_description = {
@@ -307,15 +313,23 @@ def get_dataset(
 
 def test_model():
   key = jax.random.PRNGKey(64)
-  model = GPTModel(cfg=ModelConfig(
+  rng, input_rng, dropout_rng = jax.random.split(key, 3) 
+  cfg = ModelConfig(
     block_size=64,
-    vocab_size=1024,
+    vocab_size=256,
     num_layers=4,
     num_heads=4,
-    num_embeds=96,
-  ))
-  params = model.init(key)
-  assert True
+    num_embeds=32)
+  model, train = GPTModel(cfg=cfg), False
+  batch_size, seq_len = 8, 32
+  init_input = jax.random.randint(input_rng, (batch_size, seq_len), minval=0, maxval=cfg.vocab_size)
+  init_rngs = {"params": rng, "dropout": dropout_rng}
+  params = model.init(init_rngs, init_input, train)
+  sizes = jax.tree_util.tree_map(lambda x: x.shape, params, is_leaf=lambda x: isinstance(x, jax.Array))
+  ret = model.apply(params, init_input, train) # (batch_size, seq_len, vocab_size)
+  assert ret.shape == (batch_size, seq_len, cfg.vocab_size)
+
+def test_model(): pass
 
 def count_params(params: Any) -> int:
     prms = jax.tree_util.tree_map(lambda a: a.size if isinstance(a, jax.Array) else 0, params)
