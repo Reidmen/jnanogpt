@@ -44,11 +44,10 @@ import jax.numpy as jnp
 import numpy
 import flax
 import flax.linen as nnx
+from flax.core import FrozenDict
+import flax.training.train_state as train_state
 import optax
 import dataclasses
-
-from .transformer_sd import accumulate_gradients, get_num_params
-
 from functools import partial
 from typing import Any, Callable
 
@@ -65,7 +64,7 @@ class ModelConfig:
   seq_len: int = 32
 
   # model config
-  hidden_size: int = 256  # 1024
+  hidden_size: int = 128  # 1024
   dropout_rate: float = 0.1
   mlp_expansion: int = 4
   num_layers: int = 12
@@ -74,6 +73,7 @@ class ModelConfig:
   causal_mask: bool = True
   max_seq_len: int = 64
   num_outputs: int = 512  # 2048
+  positional_encoding_type = "sinusoidal"
 
   # dtypes & lax optimizations
   dtype: jnp.dtype = jnp.bfloat16
@@ -101,7 +101,7 @@ class Config:
   seed: int = 32
 
 
-class TrainState(flax.training.train_state.TrainState):
+class TrainState(train_state.TrainState):
   rng: jax.Array
 
 
@@ -206,20 +206,19 @@ class PositionalEncoding(nnx.Module):
 
   @nnx.compact
   def __call__(self, x: jax.Array) -> jax.Array:
-    size = jax.lax.psum(1, self.cfg.model_axis_name)
-    index = jax.lax.axis_index(self.cfg.model_axis_name)
     seq_len, hidden_dim = x.shape[-2:]
     if self.cfg.positional_encoding_type == "learned":
       pos_embed = self.params("pos_embed", jax.nn.initializers.normal(stddev=0.02), (seq_len, hidden_dim))
-    elif self.cfg.positional_encoding_type == "sinusoindal":
-      position = jnp.arange(0, seq_len, dtype=jnp.float32)
-      div_factor = -numpy.log(10000.0) / (size * hidden_dim)
-      div_term = jnp.exp(jnp.arange(index * hidden_dim, (index + 1) * hidden_dim, 2)) * div_factor
+    elif self.cfg.positional_encoding_type == "sinusoidal":
+      position = jnp.arange(0, seq_len, dtype=jnp.float32)[:, None]
+      div_factor = -numpy.log(10000.0) / hidden_dim
+      div_term = jnp.exp(jnp.arange(0, hidden_dim, 2) * div_factor)
       pos_embed = jnp.stack([jnp.sin(position * div_term), jnp.cos(position * div_term)], axis=-1)
+      pos_embed = pos_embed.reshape(seq_len, hidden_dim)
     else:
       raise NotImplementedError
     pos_embed = pos_embed.astype(x.dtype)
-    pos_embed = jnp.expand_dims(pos_embed, axis=range(x.dim - 2))
+    pos_embed = jnp.expand_dims(pos_embed, axis=range(x.ndim - 2))
     x = x + pos_embed
     return x
 
@@ -229,10 +228,9 @@ class InputEmbedding(nnx.Module):
 
   @nnx.compact
   def __call__(self, x: jax.Array) -> jax.Array:
-    size = jax.lax.psum(1, self.cfg.model_axis_name)
     x = nnx.Embed(
       num_embeddings=self.cfg.vocab_size,
-      features=self.cfg.hidden_size // size,
+      features=self.cfg.hidden_size,
       embedding_init=jax.nn.initializers.normal(stddev=1.0),
       name="token_emb",
     )(x)
@@ -247,7 +245,7 @@ def dot_product_attention(
   k: jax.Array,  # (..., klen, num_heads, hidden_size)
   v: jax.Array,  # (..., ksen, num_heads, hidden_size)
   mask: jax.Array | None,
-  dtype: jax.dtype = jnp.float32_,
+  dtype: jnp.dtype = jnp.float32,
 ):
   hidden_dim = q.shape[-1]
   scale = hidden_dim ** (-0.5)
@@ -319,11 +317,7 @@ class TransformerLayers(nnx.Module):
     return x
 
 
-class PositionalEncoding(nnx.Module):
-  cfg: ModelConfig
-
-
-class TrainState(flax.training.train_state.TrainState):
+class TrainState(train_state.TrainState):
   rng: jax.Array
 
 
@@ -439,7 +433,7 @@ def execute_pipeline(
 class PipelineModule(nnx.Module):
   axis_name: str
   num_mbatches: int
-  module_fn: callable[..., nnx.Module]
+  module_fn: Callable[..., nnx.Module]
 
   @nnx.compact
   def __call__(self, *args, **kwargs):
@@ -449,8 +443,8 @@ class PipelineModule(nnx.Module):
 
 class ModelParallelismModule(nnx.Module):
   axis_name: str
-  module_fn: callable[..., nnx.Module]
-  module_kwargs: ModelConfig
+  module_fn: Callable[..., nnx.Module]
+  module_kwargs: ModelConfig | FrozenDict = FrozenDict({})
   mask_except_idx: int | None = None
   split_rngs: bool = True
 
@@ -472,11 +466,11 @@ class ModelParallelismModule(nnx.Module):
 
 class ParallelTransformer(nnx.Module):
   cfg: ModelConfig
-  pipeline_module: callable[..., nnx.Module] = PipelineModule
+  pipeline_module: Callable[..., nnx.Module] = PipelineModule
 
   @nnx.compact
   def __call__(self, x: jax.Array, mask: jax.Array | None, train: bool) -> jax.Array:
-    if mask is not None and self.cfg.causal_mask:
+    if mask is None and self.cfg.causal_mask:
       mask = nnx.make_causal_mask(x, dtype=jnp.bool_)
     # Input layer -- Only needed for the first stage
     input_emb_fn = partial(InputEmbedding, cfg=self.cfg, name="input_embedding")
@@ -504,9 +498,11 @@ class ParallelTransformer(nnx.Module):
     return x.astype(jnp.float32)
 
 
-def init_fn(rng: jax.random.PRNGKey, x: jax.Array, model: nnx.Module, optimizer: callable[...]) -> TrainState:
+def init_fn(
+  rng: jax.random.PRNGKey, x: jax.Array, model: nnx.Module, optimizer: Callable[..., "Optimizer"]
+) -> TrainState:
   init_rng, rng = jax.random.split(rng)
-  variables = model.init({"params": init_rng}, x, train=False)
+  variables = model.init({"params": init_rng}, x, mask=None, train=False)
   params = variables.pop("params")
   state = TrainState.create(apply_fn=model.apply, params=params, tx=optimizer, rng=rng)
   return state
@@ -556,24 +552,21 @@ def pp_train_step(state: TrainState, metrics: Metrics | None, batch: Batch, cfg:
 
 if __name__ == "__main__":
   cfg = Config()
-  device_array = numpy.array(jax.devices()).reshape(-1, cfg.model.model_axis_name)
+  device_array = numpy.array(jax.devices()).reshape(-1, cfg.model.model_axis_size)
   mesh = jax.sharding.Mesh(device_array, (cfg.model.data_axis_name, (cfg.model.model_axis_name)))
 
-  pp_model = ParallelTransformer(cfg=cfg)
+  pp_model = ParallelTransformer(cfg=cfg.model)
   optimizer = optax.adamw(learning_rate=cfg.optimizer.learning_rate)
 
   rng = jax.random.PRNGKey(cfg.seed)
   model_init_rng, data_input_rng = jax.random.split(rng, 2)
   tokens = jax.random.randint(data_input_rng, (cfg.model.batch_size, cfg.model.seq_len), 1, cfg.model.vocab_size)
-  batch = Batch(
-    input=jnp.pad(tokens[:, :-1], ((0, 0), (1, 0)), constant_value=0),
-    labels=tokens,
-  )
+  batch = Batch(inputs=jnp.pad(tokens[:, :-1], ((0, 0), (1, 0))), labels=tokens)
   pp_init_fn = jax.shard_map(
     partial(init_fn, model=pp_model, optimizer=optimizer),
-    mesh,
     in_specs=(PartitionSpec(), PartitionSpec(cfg.model.data_axis_name)),
     out_specs=PartitionSpec(),
+    mesh=mesh,
   )
   pp_state_shapes = jax.eval_shape(pp_init_fn, model_init_rng, batch.inputs)
   pp_state_specs = nnx.get_partition_spec(pp_state_shapes)
@@ -608,7 +601,7 @@ if __name__ == "__main__":
   pp_state, pp_metrics = pp_train_step_fn(pp_state, pp_metrics, batch)
   print(f"Number of parameters: {get_num_params(pp_state)}")
 
-  for _ in range(15):
+  for _ in range(10):
     pp_state, pp_metrics = pp_train_step_fn(pp_state, pp_metrics, batch)
 
   pp_final_metrics = jax.tree_util.tree_map(lambda x: jnp.zeros(x.shape, dtype=x.dtype), metric_shapes)

@@ -1,5 +1,11 @@
 import functools
 import os
+from typing import Any
+
+import flax.jax_utils
+import flax.jax_utils
+import flax.training
+import flax.training.checkpoints
 
 
 def set_xla_flags_gpu():
@@ -46,7 +52,7 @@ class ModelConfig:
   dtype: jnp.dtype = jnp.bfloat16
   deterministic: bool = False
   use_proj_bias: bool = True
-  remat: bool = False
+  remat: tuple[str,...] = ("Attn", "MLP") 
 
 
 class SelfAttention(nnx.Module):
@@ -194,7 +200,7 @@ class TrainConfig:
   learning_rate: CosineDecayScheduleConfig = dataclasses.field(default_factory=CosineDecayScheduleConfig)
   wandb: WandbConfig = dataclasses.field(default_factory=WandbConfig)
   model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
-  remat: bool = False
+  # remat: bool = False
 
 
 @functools.partial(jax.pmap, axis_name="batch")
@@ -233,7 +239,7 @@ def evaluate(state: TrainState, ds: tf.data.Dataset, batch_size: int, block_size
   return jnp.mean(jnp.stack(losses))
 
 
-def init_train_sate(key, lr, cfg: TrainConfig) -> TrainState:
+def init_train_state(key, lr, cfg: TrainConfig) -> TrainState:
   model = GPTModel(cfg=cfg)
   params = model.init(key)
   optimizer = optax.chain(
@@ -242,6 +248,7 @@ def init_train_sate(key, lr, cfg: TrainConfig) -> TrainState:
     optax.apply_every(cfg.gradient_accumulation_steps),
   )
   train_state = TrainState.create(apply_fn=model.apply, params=params, tx=optimizer)
+  return train_state
 
 
 def get_default_config() -> TrainConfig:
@@ -255,35 +262,93 @@ def get_default_config() -> TrainConfig:
     return from_yaml(TrainConfig, f)
 
 
-if __name__ == "__main__":
+import tensorflow as tf
+
+OPTIONS = tf.data.Options()
+OPTIONS.deterministic = True
+OPTIONS.autotune.enabled = True
+
+
+def get_dataset(
+  pattern: str,
+  batch_size: int = 8,
+  block_size: int = 1024,
+  shuffle_buffer_size: int | None = None,
+  repeat: int | None = None,
+  seed: int | None = None,
+) -> tf.data.Dataset:
+  tf.random.set_seed(seed)
+  ile_ds = tf.data.Dataset.list_files(pattern, shuffle=bool(shuffle_buffer_size))
+  file_ds = file_ds.shard(jax.process_count(), jax.process_index())
+  ds = tf.data.TFRecordDataset(file_ds, num_parallel_reads=tf.data.AUTOTUNE)
+  feature_description = {
+    "ids": tf.io.FixedLenFeature([], tf.string, default_value=""),
+  }
+
+  def _parse_proto(example_proto):
+    example = tf.io.parse_single_example(example_proto, feature_description)
+    return tf.io.decode_raw(example["ids"], tf.uint16)
+
+  ds = ds.map(_parse_proto, num_parallel_calls=tf.data.AUTOTUNE)
+  ds = ds.repeat(repeat)
+
+  if shuffle_buffer_size is not None:
+    ds = ds.shuffle(shuffle_buffer_size)
+
+  ds = ds.unbatch().batch(block_size + 1, drop_remainder=True)
+  if shuffle_buffer_size is not None:
+    ds = ds.shuffle(shuffle_buffer_size)
+
+  ds = ds.batch(batch_size, drop_remainder=True)
+  ds = ds.batch(jax.local_device_count(), drop_remainder=True)
+  ds = ds.with_options(OPTIONS)
+  return ds.prefetch(2)
+
+
+def test_model():
+  key = jax.random.PRNGKey(64)
+  model = GPTModel(cfg=ModelConfig(
+    block_size=64,
+    vocab_size=1024,
+    num_layers=4,
+    num_heads=4,
+    num_embeds=96,
+  ))
+  params = model.init(key)
+  assert True
+
+def count_params(params: Any) -> int:
+    prms = jax.tree_util.tree_map(lambda a: a.size if isinstance(a, jax.Array) else 0, params)
+    return jax.tree_util.tree_reduce(lambda a, b: a + b, prms)
+
+
+def train():
   import wandb
 
-  config = tyro.cli(TrainConfig, default=get_default_config())
+  # Allow user provided and yaml config
+  cfg = get_default_config()
+  if cfg.wandb is not None and jax.process_index() == 0:
+    wandb.init(**cfg.wandb)
+    wandb.config.update(**cfg)
 
-  if config.wandb is not None and jax.process_index() == 0:
-    wandb.init(**asdict(config.wandb))
-    wandb.config.update(asdict(config))
-
-  block_size = config.model.block_size
+  block_size = cfg.model.block_size
 
   # ===== datasets =====
-  train_ds = get_dataset(
-    config.train_pattern, config.batch_size, block_size, config.shuffle_buffer_size, seed=config.seed
-  )
+  train_ds = get_dataset(cfg.train_pattern, cfg.batch_size, block_size, cfg.shuffle_buffer_size, seed=cfg.seed)
 
-  val_ds = get_dataset(config.val_pattern, config.batch_size, block_size, repeat=1)
+  val_ds = get_dataset(cfg.val_pattern, cfg.batch_size, block_size, repeat=1)
 
   # =====  init parameters ============
-  key = jax.random.PRNGKey(config.seed)
+  key = jax.random.PRNGKey(cfg.seed)
   key, key_params, key_dropout = jax.random.split(key, 3)
   # make sure dropout keys are different for each device (local and global)
   key_dropout = jax.random.fold_in(key_dropout, jax.process_index())
   keys_dropout = jax.random.split(key_dropout, jax.local_device_count())
 
   # ===== learning rate schedule =====
-  learning_rate = optax.warmup_cosine_decay_schedule(**asdict(config.learning_rate))
+  learning_rate = optax.warmup_cosine_decay_schedule(**cfg.learning_rate)
 
-  train_state = init_train_state(key_params, config, learning_rate)
+  train_state = init_train_state(key_params, cfg, learning_rate)
 
   num_params = count_params(train_state.params)
   if jax.process_index() == 0:
@@ -295,7 +360,7 @@ if __name__ == "__main__":
   # ==== restore dataset and train state ==== #
   # restore unreplicated optimizer + model state from last checkpoint.
   # this is a no-op if no checkpoints exist
-  train_state = checkpoints.restore_checkpoint(f"{config.out_dir}/checkpoints/train_state", train_state)
+  train_state = flax.training.checkpoints.restore_checkpoint(f"{cfg.out_dir}/checkpoints/train_state", train_state)
 
   # grab step from last checkpoint
   step = int(train_state.step)
@@ -305,98 +370,51 @@ if __name__ == "__main__":
   # we'll save a dataset checkpoint for each shard
   dataset_manager = tf.train.CheckpointManager(
     tf.train.Checkpoint(iterator=train_iter),
-    f"{config.out_dir}/checkpoints/dataset_{jax.process_index()}",
-    max_to_keep=config.keep_checkpoints,
+    f"{cfg.out_dir}/checkpoints/dataset_{jax.process_index()}",
+    max_to_keep=cfg.keep_checkpoints,
   )
   dataset_manager.restore_or_initialize()
 
   # replicate parameters to each device
-  train_state = replicate(train_state)
+  train_state = flax.jax_utils.replicate(train_state)
 
-  for step in range(step, config.train_steps):
-    if step % config.eval_interval == 0:
-      val_loss = evaluate(train_state, val_ds, config.batch_size, block_size, config.eval_steps)
+  for step in range(step, cfg.train_steps):
+    if step % cfg.eval_interval == 0:
+      val_loss = evaluate(train_state, val_ds, cfg.batch_size, block_size, cfg.eval_steps)
 
-      if config.eval_only:
+      if cfg.eval_only:
         break
 
       if val_loss < best_val_loss:
         best_val_loss = val_loss
         if jax.process_index() == 0:
           # save train state in process 0
-          checkpoints.save_checkpoint(
-            f"{config.out_dir}/checkpoints/train_state",
-            unreplicate(train_state),
+          flax.training.checkpoints.save_checkpoint(
+            f"{cfg.out_dir}/checkpoints/train_state",
+            flax.jax_utils.unreplicate(train_state),
             step,
-            keep=config.keep_checkpoints,
+            keep=cfg.keep_checkpoints,
             overwrite=True,
           )
         dataset_manager.save(step)
 
-      if (config.wandb is not None) and (jax.process_index() == 0):
+      if (cfg.wandb is not None) and (jax.process_index() == 0):
         wandb.log({"val/loss": val_loss}, step=step)
 
     tokens = next(train_iter)._numpy()
     loss, train_state = train_step(train_state, tokens, keys_dropout)
 
-    if (config.wandb is not None) and (jax.process_index() == 0):
+    if (cfg.wandb is not None) and (jax.process_index() == 0):
       wandb.log(
         {
           "train/loss": loss[0].item(),
           "lr": learning_rate(step) if callable(learning_rate) else learning_rate,
           "step": step,
-          "block": step * config.batch_size * jax.device_count(),
+          "block": step * cfg.batch_size * jax.device_count(),
         },
         step=step,
       )
 
 
-"""
-# TESTING
-
-hf_config = GPT2Config(
-    vocab_size=256,
-    n_positions=32,
-    n_embd=64,
-    n_layer=1,
-    n_head=2,
-    resid_pdrop=0.1,
-    embd_pdrop=0.1,
-    attn_pdrop=0.1,
-    layer_norm_epsilon=1e-6,
-    use_cache=False
-)
-
-config = GPTConfig(
-    vocab_size=256,
-    block_size=32,
-    num_embeds=64,
-    num_layers=1,
-    num_heads=2,
-    dropout_rate=0.1,
-)
-
-
-def test_gpt2():
-    key = jax.random.PRNGKey(0)
-    key, key_idxs, key_params = jax.random.split(key, 3)
-
-    hf_model = FlaxGPT2LMHeadModel(hf_config)
-    hf_params = hf_model.init_weights(key_params, (2, 32))
-    model = GPT(config)
-
-    params = model.init(key_params)
-    target_shapes = jax.tree_util.tree_map(lambda a: a.shape, params)
-    params = convert_hf_params(hf_params, 2, 64)
-    shapes = jax.tree_util.tree_map(lambda a: a.shape, params)
-
-    assert shapes == target_shapes
-
-    for k in ('ln_f', 'wpe', 'wte'):
-        assert params['params'][k] == hf_params['transformer'][k]
-
-    idxs = jax.random.randint(key_idxs, (2, 32), 0, 256)
-    y1 = hf_model(idxs, params=hf_params).logits
-    y2 = model.apply(params, idxs, True)
-    assert jnp.allclose(y1, y2, atol=1e-6)
-"""
+if __name__ == "__main__":
+  test_model()
