@@ -1,12 +1,5 @@
-import functools
 import os
-from typing import Any
-
-import flax.jax_utils
-import flax.jax_utils
-import flax.training
-import flax.training.checkpoints
-
+import numpy
 
 def set_xla_flags_gpu():
   flags = os.environ.get("XLA_FLAGS", "")
@@ -20,8 +13,27 @@ def set_xla_flags_gpu():
   os.environ["XLA_FLAGS"] = flags
 
 
+def set_xla_flags_cpu(device_count: int = 8):
+  flags = os.environ.get("XLA_FLAGS", "")
+  flags += f" --xla_force_host_platform_device_count={device_count}"
+  os.environ["XLA_FLAGS"] = flags
+  os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+
+# Check for temporal flags
+if os.getenv("USE_GPU", False):
+  set_xla_flags_gpu()
+else:
+  set_xla_flags_cpu(8)
+
 print(f"XLA flags: {os.environ.get('XLA_FLAGS', '')}")
 
+
+from typing import Any
+import functools
+import flax.jax_utils
+import flax.training
+import flax.training.checkpoints
 import flax.core
 import jax
 import jax.numpy as jnp
@@ -42,18 +54,20 @@ static_compatible_dataclass = lambda cls: tree_util.register_static(dataclasses.
 @static_compatible_dataclass
 class ModelConfig:
   block_size: int = 1024
-  vocab_size: int = 1024 * 8# 50304 
+  vocab_size: int = 1024 * 8  # 50304
   num_layers: int = 12
   num_heads: int = 12
-  num_embeds: int = 768
+  embed_size: int = 768
   epsilon: float = 1e-5
   mlp_expansion_factor: int = 4
   dropout_rate: float = 0.1
   use_bias: bool = True
   dtype: jnp.dtype = jnp.bfloat16
-  deterministic: bool = True 
+  train: bool = True
   use_proj_bias: bool = True
-  remat: tuple[str,...] = ("Attn", "MLP") 
+  remat: tuple[str, ...] = ("Attn", "MLP")
+  model_axis_size: int = 8
+  model_axis_name: str = "model"
 
 
 class SelfAttention(nnx.Module):
@@ -65,12 +79,12 @@ class SelfAttention(nnx.Module):
     assert hidden_dim % self.cfg.num_heads == 0
     head_dim = hidden_dim // self.cfg.num_heads
     qkv = nnx.Dense(features=3 * hidden_dim, use_bias=self.cfg.use_proj_bias, dtype=self.cfg.dtype, name="c_attn")(x)
-    qkv = qkv.reshape(batch_size, seq_len, 3 * self.cfg.num_heads, head_dim) 
-    q, k, v = jnp.array_split(qkv, indices_or_sections=3, axis=2) # (batch_size, seq_len, num_heads, head_dim)
-    attn = jax.nn.dot_product_attention(q, k, v, bias=None) # Add mask here
+    qkv = qkv.reshape(batch_size, seq_len, 3 * self.cfg.num_heads, head_dim)
+    q, k, v = jnp.array_split(qkv, indices_or_sections=3, axis=2)  # (batch_size, seq_len, num_heads, head_dim)
+    attn = jax.nn.dot_product_attention(q, k, v, bias=None)  # Add mask here
     attn = attn.reshape((batch_size, seq_len, hidden_dim))
     x = nnx.Dense(features=hidden_dim, use_bias=self.cfg.use_proj_bias, dtype=self.cfg.dtype, name="c_proj")(attn)
-    x = nnx.Dropout(rate=self.cfg.dropout_rate, deterministic=self.cfg.deterministic)(x)
+    x = nnx.Dropout(rate=self.cfg.dropout_rate, deterministic=not self.cfg.train)(x)
     return x
 
 
@@ -85,7 +99,7 @@ class MLP(nnx.Module):
     )(x)
     x = nnx.gelu(x, approximate=True)
     x = nnx.Dense(features=hidden_dim, dtype=self.cfg.dtype, use_bias=self.cfg.use_bias, name="c_proj")(x)
-    x = nnx.Dropout(rate=self.cfg.dropout_rate, deterministic=self.cfg.deterministic)(x)
+    x = nnx.Dropout(rate=self.cfg.dropout_rate, deterministic=not self.cfg.train)(x)
     return x
 
 
@@ -94,7 +108,7 @@ class Block(nnx.Module):
 
   @nnx.compact
   def __call__(self, x: jax.Array, mask: jax.Array):
-    residual = x # (batch_size, seq_len, hidden_dim)
+    residual = x  # (batch_size, seq_len, hidden_dim)
     # Attention block
     x = nnx.LayerNorm(epsilon=self.cfg.epsilon, dtype=self.cfg.dtype, use_bias=self.cfg.use_bias)(x)
     attn_block = SelfAttention
@@ -114,20 +128,20 @@ class GPTModel(nnx.Module):
   cfg: ModelConfig
 
   @nnx.compact
-  def __call__(self, idx: jax.Array, train: bool):
+  def __call__(self, idx: jax.Array) -> jax.Array:
     batch_size, seq_len = idx.shape
     position = jnp.arange(0, seq_len)[None, :]
     attn_mask = nnx.make_causal_mask(idx, dtype=bool)
 
     wte = nnx.Embed(
-      num_embeddings=self.cfg.vocab_size, features=self.cfg.num_embeds, dtype=self.cfg.dtype, name="wte"
-    ) # (vocab_size, embed_dim)
+      num_embeddings=self.cfg.vocab_size, features=self.cfg.embed_size, dtype=self.cfg.dtype, name="wte"
+    )  # (vocab_size, embed_dim)
     wpe = nnx.Embed(
-      num_embeddings=self.cfg.block_size, features=self.cfg.num_embeds, dtype=self.cfg.dtype, name="wpe"
-    ) # (vocab_size, embed_dim)
+      num_embeddings=self.cfg.block_size, features=self.cfg.embed_size, dtype=self.cfg.dtype, name="wpe"
+    )  # (vocab_size, embed_dim)
     token_embed = wte(idx)  # (batch_size, seq_len, num_embed)
     position_embed = wpe(position)  # (1, seq_len, num_embed)
-    x = nnx.Dropout(rate=self.cfg.dropout_rate, deterministic=not train)(token_embed + position_embed)
+    x = nnx.Dropout(rate=self.cfg.dropout_rate, deterministic=not self.cfg.train)(token_embed + position_embed)
     for i in range(self.cfg.num_layers):
       x = Block(self.cfg, name=f"block_{i}")(x, attn_mask)
     x = nnx.LayerNorm(self.cfg.epsilon, dtype=self.cfg.dtype, use_bias=self.cfg.use_bias, name="ln_f")(x)
@@ -161,7 +175,7 @@ def get_pretrained_params(model_type: str) -> tuple[ModelConfig, dict]:
     "gpt2-xl": ModelConfig(num_layers=48, num_heads=25, num_embeds=1600),
   }.get(model_type)
   model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-  params = convert_hf_params(model_hf, config.num_heads, config.num_embeds)
+  params = convert_hf_params(model_hf, config.num_heads, config.embed_size)
   return config, params
 
 
@@ -210,17 +224,16 @@ class TrainConfig:
 
 
 @functools.partial(jax.pmap, axis_name="batch")
-def train_step(state: TrainState, tokens: jnp.ndarray, dropout_key: jax.random.PRNGKey) -> tuple[jax.Array, jax.Array]:
+def train_step(state: TrainState, tokens: jax.Array, dropout_key: jax.random.PRNGKey) -> tuple[jax.Array, jax.Array]:
   dropout_key = jax.random.fold_in(dropout_key, state.step)
 
-  def _loss(params: flax.core.FrozenDict) -> jnp.ndarray:
+  def _loss(params: flax.core.FrozenDict) -> jax.Array:
     X, Y = tokens[:, :-1], tokens[:, 1:]
-    logits = state.apply_fn(params, X, False, rngs={"dropout": dropout_key})
+    logits = state.apply_fn(params, X, rngs={"dropout": dropout_key})
     loss = optax.softmax_cross_entropy_with_integer_labels(logits, Y).mean()
     return loss
 
-  # per-device loss and grads
-  loss, grads = jax.value_and_grad(_loss, has_aux=False)(state.params)
+  loss, grads = jax.value_and_grad(_loss, has_aux=False)(state.params)  # per-device
   grads = jax.lax.pmean(grads, axis_name="batch")
   loss = jax.lax.pmean(loss, axis_name="batch")
   new_state = state.apply_gradients(grads=grads)
@@ -245,12 +258,13 @@ def evaluate(state: TrainState, ds: tf.data.Dataset, batch_size: int, block_size
   return jnp.mean(jnp.stack(losses))
 
 
-def init_train_state(key, lr, cfg: TrainConfig) -> TrainState:
-  model = GPTModel(cfg=cfg)
-  params = model.init(key)
+def init_train_state(
+  model: nnx.Module, key: jax.random.PRNGKey, input: jax.Array, lr: Any, cfg: TrainConfig
+) -> TrainState:
+  params = model.init(key, input)
   optimizer = optax.chain(
     optax.clip_by_global_norm(cfg.grad_clip),
-    optax.adamw(lr, **cfg.betas, weight_decay=cfg.weight_decay),
+    optax.adamw(lr, *cfg.betas, weight_decay=cfg.weight_decay),
     optax.apply_every(cfg.gradient_accumulation_steps),
   )
   train_state = TrainState.create(apply_fn=model.apply, params=params, tx=optimizer)
@@ -313,27 +327,40 @@ def get_dataset(
 
 def test_model():
   key = jax.random.PRNGKey(64)
-  rng, input_rng, dropout_rng = jax.random.split(key, 3) 
-  cfg = ModelConfig(
-    block_size=64,
-    vocab_size=256,
-    num_layers=4,
-    num_heads=4,
-    num_embeds=32)
-  model, train = GPTModel(cfg=cfg), False
+  rng, input_rng, dropout_rng = jax.random.split(key, 3)
+  cfg = ModelConfig(block_size=64, vocab_size=256, num_layers=4, num_heads=4, embed_size=32, train=False)
+  model = GPTModel(cfg=cfg)
   batch_size, seq_len = 8, 32
   init_input = jax.random.randint(input_rng, (batch_size, seq_len), minval=0, maxval=cfg.vocab_size)
   init_rngs = {"params": rng, "dropout": dropout_rng}
-  params = model.init(init_rngs, init_input, train)
+  params = model.init(init_rngs, init_input)
+  print(f"Model size: {count_params(params)}")
   sizes = jax.tree_util.tree_map(lambda x: x.shape, params, is_leaf=lambda x: isinstance(x, jax.Array))
-  ret = model.apply(params, init_input, train) # (batch_size, seq_len, vocab_size)
+  print(f"Model param sizes: \n{sizes}")
+  ret = model.apply(params, init_input)  # (batch_size, seq_len, vocab_size)
   assert ret.shape == (batch_size, seq_len, cfg.vocab_size)
 
-def test_model(): pass
+
+def test_train():
+  cfg = ModelConfig(block_size=64, vocab_size=256, num_layers=4, num_heads=4, embed_size=32, train=True)
+  init_rng = jax.random.PRNGKey(32)
+  rng, input_rng = jax.random.split(init_rng, 2)
+  model = GPTModel(cfg=cfg)
+  batch_size, seq_len = 8, 32
+  init_tokens = jax.random.randint(input_rng, (batch_size, seq_len), minval=0, maxval=cfg.vocab_size)
+  # init_rngs = {"params": rng, "dropout": dropout_rng}
+  _, key_params, key_dropout = jax.random.split(rng, 3)
+  key_dropout = jax.random.fold_in(key_dropout, jax.process_index())
+  keys_dropout = jax.random.split(key_dropout, jax.local_device_count())
+  train_cfg = TrainConfig()
+  learning_rate = optax.warmup_cosine_decay_schedule(**dataclasses.asdict(train_cfg.learning_rate))
+  train_state = init_train_state(model, key_params, init_tokens, learning_rate, train_cfg)
+  loss, train_state = train_step(train_state, init_tokens, keys_dropout)
+
 
 def count_params(params: Any) -> int:
-    prms = jax.tree_util.tree_map(lambda a: a.size if isinstance(a, jax.Array) else 0, params)
-    return jax.tree_util.tree_reduce(lambda a, b: a + b, prms)
+  prms = jax.tree_util.tree_map(lambda a: a.size if isinstance(a, jax.Array) else 0, params)
+  return jax.tree_util.tree_reduce(lambda a, b: a + b, prms)
 
 
 def train():
@@ -431,4 +458,5 @@ def train():
 
 
 if __name__ == "__main__":
-  test_model()
+  # test_model()
+  test_train()

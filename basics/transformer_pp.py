@@ -91,7 +91,7 @@ class ModelConfig:
 @static_compatible_dataclass
 class OptimizerConfig:
   learning_rate: float = 4e-4
-  num_minibatches: int = 4
+  num_microbatches: int = 4
 
 
 @static_compatible_dataclass
@@ -192,11 +192,12 @@ class MLPBlock(nnx.Module):
 
   @nnx.compact
   def __call__(self, x: jax.Array) -> jax.Array:
-    input_features = x.shape[-1]
+    hidden_dim = x.shape[-1]
     residual = x
     x = nnx.LayerNorm(dtype=self.cfg.dtype, name="pre_norm")(x)
     x = nnx.Dense(features=self.cfg.hidden_size * self.cfg.mlp_expansion, dtype=self.cfg.dtype, name="input_dense")(x)
     x = nnx.silu(x)
+    x = nnx.Dense(features=hidden_dim, dtype=self.cfg.dtype, name="output_layer")(x) 
     x = nnx.Dropout(rate=self.cfg.dropout_rate, deterministic=not self.train)(x)
     return x + residual
 
@@ -270,7 +271,7 @@ class AttentionBlock(nnx.Module):
     hidden_dim = x.shape[-1]
     x = nnx.LayerNorm(dtype=self.cfg.dtype, name="pre_norm")(x)
     num_heads = self.cfg.hidden_size // self.cfg.head_dim
-    qkv = nnx.DenseGeneral(features=(num_heads, self.cfg.head_dim * 3), dtype=self.cfg.dtype, nam="qkv")(x)
+    qkv = nnx.DenseGeneral(features=(num_heads, self.cfg.head_dim * 3), dtype=self.cfg.dtype, name="qkv")(x)
     q, k, v = jnp.split(qkv, 3, axis=-1)
     x = dot_product_attention(q, k, v, mask=self.mask, dtype=self.cfg.dtype)
     x = nnx.DenseGeneral(features=hidden_dim, axis=(-2, -1), dtype=self.cfg.dtype, name="output_layer")(x)
@@ -293,14 +294,17 @@ class TransformerBlock(nnx.Module):
     if "Attn" in self.cfg.remat:
       attn = nnx.remat(attn, prevent_cse=False)
     x = x + attn(cfg=self.cfg, mask=self.mask, train=self.train, name="attn")(x)
+    return x
 
 
 class TransformerLayers(nnx.Module):
   cfg: ModelConfig
+  mask: jax.Array | None
+  train: bool
 
   @nnx.compact
-  def __call__(self, x: jax.Array, mask: jax.Array | None, train: bool = True) -> jax.Array:
-    block_fn = partial(TransformerBlock, config=self.cfg, mask=mask, train=train)
+  def __call__(self, x: jax.Array) -> jax.Array:
+    block_fn = partial(TransformerBlock, cfg=self.cfg, mask=self.mask, train=self.train)
     if "Block" in self.cfg.remat:
       block_fn = nnx.remat(block_fn, prevent_cse=False)
     if self.cfg.scan_layers:
@@ -424,7 +428,7 @@ def execute_pipeline(
     length=num_iterations,
     in_axes=0,
     out_axes=0,
-  )(module, state, input)
+  )(module, state, input_array)
   # Take last num_microbatches, all the rest are zeros.
   outputs = jnp.concatenate(outputs[-num_microbatches:], axis=0)
   return outputs
@@ -432,13 +436,15 @@ def execute_pipeline(
 
 class PipelineModule(nnx.Module):
   axis_name: str
-  num_mbatches: int
+  num_microbatches: int
   module_fn: Callable[..., nnx.Module]
 
   @nnx.compact
   def __call__(self, *args, **kwargs):
     module = self.module_fn()
-    return execute_pipeline(module, *args, self.num_mbatches, self.axis_name, **kwargs)
+    return execute_pipeline(
+      module, *args, num_microbatches=self.num_microbatches, model_axis_name=self.axis_name, **kwargs
+    )
 
 
 class ModelParallelismModule(nnx.Module):
@@ -465,35 +471,36 @@ class ModelParallelismModule(nnx.Module):
 
 
 class ParallelTransformer(nnx.Module):
-  cfg: ModelConfig
+  cfg: Config
   pipeline_module: Callable[..., nnx.Module] = PipelineModule
 
   @nnx.compact
   def __call__(self, x: jax.Array, mask: jax.Array | None, train: bool) -> jax.Array:
-    if mask is None and self.cfg.causal_mask:
+    if mask is None and self.cfg.model.causal_mask:
       mask = nnx.make_causal_mask(x, dtype=jnp.bool_)
     # Input layer -- Only needed for the first stage
-    input_emb_fn = partial(InputEmbedding, cfg=self.cfg, name="input_embedding")
+    input_emb_fn = partial(InputEmbedding, cfg=self.cfg.model, name="input_embedding")
     x = ModelParallelismModule(
-      module_fn=input_emb_fn, axis_name=self.cfg.model_axis_name, mask_except_idx=0, name="pp_embed"
+      module_fn=input_emb_fn, axis_name=self.cfg.model.model_axis_name, mask_except_idx=0, name="pp_embed"
     )(x)
     # Pipeline
-    stage_module_fn = partial(TransformerLayers, config=self.cfg, train=train, name="mlp_layers")
+    stage_module_fn = partial(TransformerLayers, mask=mask, cfg=self.cfg.model, train=train, name="transformer_layers")
     pipeline_module_fn = partial(
       self.pipeline_module,
-      axis_name=self.cfg.model_axis_name,
-      num_mbatches=self.cfg.num_microbatches,
+      axis_name=self.cfg.model.model_axis_name,
+      num_microbatches=self.cfg.optimizer.num_microbatches,
       module_fn=stage_module_fn,
     )
-    module = ModelParallelismModule(module_fn=pipeline_module_fn, axis_name=self.cfg.model_axis_name, name="pipeline")
-    x = module(x)
+    x = ModelParallelismModule(
+      module_fn=pipeline_module_fn, axis_name=self.cfg.model.model_axis_name, name="pipeline"
+    )(x)
     # Output -- Only needed for the last stage
     parallelism_module = partial(
-      ModelParallelismModule, axis_name=self.cfg.model_axis_name, mask_except_idx=self.cfg.model_axis_size
+      ModelParallelismModule, axis_name=self.cfg.model.model_axis_name, mask_except_idx=self.cfg.model_axis_size
     )
-    x = parallelism_module(module_fn=partial(nnx.LayerNorm, dtype=self.cfg.dtype), name="output_norm")(x)
+    x = parallelism_module(module_fn=partial(nnx.LayerNorm, dtype=self.cfg.model.dtype), name="output_norm")(x)
     x = parallelism_module(
-      module_fn=partial(nnx.Dense, features=self.cfg.num_outputs, dtype=self.cfg.dtype), name="output_layer"
+      module_fn=partial(nnx.Dense, features=self.cfg.num_outputs, dtype=self.cfg.model.dtype), name="output_layer"
     )(x)
     return x.astype(jnp.float32)
 
@@ -532,7 +539,7 @@ def pp_train_step(state: TrainState, metrics: Metrics | None, batch: Batch, cfg:
     state,
     batch,
     step_rng,
-    cfg.optimizer.num_minibatches,
+    cfg.optimizer.num_microbatches,
     loss_fn=loss_fn,
   )
   with jax.named_scope("sync_gradients"):
@@ -555,7 +562,7 @@ if __name__ == "__main__":
   device_array = numpy.array(jax.devices()).reshape(-1, cfg.model.model_axis_size)
   mesh = jax.sharding.Mesh(device_array, (cfg.model.data_axis_name, (cfg.model.model_axis_name)))
 
-  pp_model = ParallelTransformer(cfg=cfg.model)
+  pp_model = ParallelTransformer(cfg=cfg)
   optimizer = optax.adamw(learning_rate=cfg.optimizer.learning_rate)
 
   rng = jax.random.PRNGKey(cfg.seed)
