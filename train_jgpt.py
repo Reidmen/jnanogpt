@@ -24,7 +24,7 @@ def set_xla_flags_cpu(device_count: int = 8):
 if os.getenv("USE_GPU", False):
   set_xla_flags_gpu()
 else:
-  set_xla_flags_cpu(8)
+  set_xla_flags_cpu(1)
 
 print(f"XLA flags: {os.environ.get('XLA_FLAGS', '')}")
 
@@ -223,29 +223,29 @@ class TrainConfig:
   # remat: bool = False
 
 
-@functools.partial(jax.pmap, axis_name="batch")
+@jax.jit
 def train_step(state: TrainState, tokens: jax.Array, dropout_key: jax.random.PRNGKey) -> tuple[jax.Array, jax.Array]:
-  dropout_key = jax.random.fold_in(dropout_key, state.step)
+  # dropout_key = jax.random.fold_in(dropout_key, state.step)
 
   def _loss(params: flax.core.FrozenDict) -> jax.Array:
     X, Y = tokens[:, :-1], tokens[:, 1:]
-    logits = state.apply_fn(params, X, rngs={"dropout": dropout_key})
+    logits = state.apply_fn(params, X, rngs={'dropout': dropout_key})
     loss = optax.softmax_cross_entropy_with_integer_labels(logits, Y).mean()
     return loss
 
   loss, grads = jax.value_and_grad(_loss, has_aux=False)(state.params)  # per-device
-  grads = jax.lax.pmean(grads, axis_name="batch")
-  loss = jax.lax.pmean(loss, axis_name="batch")
+  # grads = jax.lax.pmean(grads, axis_name="batch")
+  # loss = jax.lax.pmean(loss, axis_name="batch")
   new_state = state.apply_gradients(grads=grads)
   return loss, new_state
 
 
-@functools.partial(jax.pmap, axis_name="batch")
+@jax.jit
 def eval_step(state: TrainState, tokens: jnp.ndarray) -> jnp.ndarray:
   X, Y = tokens[:, :-1], tokens[:, 1:]
   logits = state.apply_fn(state.params, X, True)
   loss = optax.softmax_cross_entropy_with_integer_labels(logits, Y)
-  loss = jax.lax.pmean(loss, axis_name="batch")
+  # loss = jax.lax.pmean(loss, axis_name="batch")
   return loss
 
 
@@ -350,12 +350,13 @@ def test_train():
   init_tokens = jax.random.randint(input_rng, (batch_size, seq_len), minval=0, maxval=cfg.vocab_size)
   # init_rngs = {"params": rng, "dropout": dropout_rng}
   _, key_params, key_dropout = jax.random.split(rng, 3)
-  key_dropout = jax.random.fold_in(key_dropout, jax.process_index())
-  keys_dropout = jax.random.split(key_dropout, jax.local_device_count())
   train_cfg = TrainConfig()
   learning_rate = optax.warmup_cosine_decay_schedule(**dataclasses.asdict(train_cfg.learning_rate))
   train_state = init_train_state(model, key_params, init_tokens, learning_rate, train_cfg)
-  loss, train_state = train_step(train_state, init_tokens, keys_dropout)
+  loss, train_state = train_step(train_state, init_tokens, key_dropout)
+  assert train_state.step == 1
+  assert loss.shape == ()
+
 
 
 def count_params(params: Any) -> int:
@@ -365,58 +366,39 @@ def count_params(params: Any) -> int:
 
 def train():
   import wandb
-
-  # Allow user provided and yaml config
   cfg = get_default_config()
   if cfg.wandb is not None and jax.process_index() == 0:
     wandb.init(**cfg.wandb)
     wandb.config.update(**cfg)
 
   block_size = cfg.model.block_size
-
-  # ===== datasets =====
   train_ds = get_dataset(cfg.train_pattern, cfg.batch_size, block_size, cfg.shuffle_buffer_size, seed=cfg.seed)
-
   val_ds = get_dataset(cfg.val_pattern, cfg.batch_size, block_size, repeat=1)
-
-  # =====  init parameters ============
-  key = jax.random.PRNGKey(cfg.seed)
-  key, key_params, key_dropout = jax.random.split(key, 3)
-  # make sure dropout keys are different for each device (local and global)
-  key_dropout = jax.random.fold_in(key_dropout, jax.process_index())
-  keys_dropout = jax.random.split(key_dropout, jax.local_device_count())
-
-  # ===== learning rate schedule =====
   learning_rate = optax.warmup_cosine_decay_schedule(**cfg.learning_rate)
+  init_rng = jax.random.PRNGKey(cfg.seed)
+  rng, rng_params, rng_dropout, rng_model = jax.random.split(init_rng, 4) 
 
-  train_state = init_train_state(key_params, cfg, learning_rate)
+  model_cfg = ModelConfig(block_size=64, vocab_size=256, num_layers=4, num_heads=4, embed_size=32, train=True)
+  model = GPTModel(cfg=model_cfg) 
+  batch_size, seq_len = (32, 128)
+  init_tokens = jax.random.randint(rng_params, (batch_size, seq_len), minval=0, maxval=model_cfg.vocab_size)
+  train_state = init_train_state(model, rng_params, init_tokens, learning_rate, cfg)
 
-  num_params = count_params(train_state.params)
   if jax.process_index() == 0:
-    # logging.info(f'PARAMETER COUNT: {num_params:,}')
-    print(f"PARAMETER COUNT: {num_params:,}")
+    num_params = count_params(train_state.params)
+    print(f"Parameters count {num_params}")
 
   best_val_loss = float("inf")
 
-  # ==== restore dataset and train state ==== #
-  # restore unreplicated optimizer + model state from last checkpoint.
-  # this is a no-op if no checkpoints exist
   train_state = flax.training.checkpoints.restore_checkpoint(f"{cfg.out_dir}/checkpoints/train_state", train_state)
-
-  # grab step from last checkpoint
   step = int(train_state.step)
-
   train_iter = iter(train_ds)
-  # We need to be able to save the dataset state for stopping and resuming training
-  # we'll save a dataset checkpoint for each shard
   dataset_manager = tf.train.CheckpointManager(
     tf.train.Checkpoint(iterator=train_iter),
     f"{cfg.out_dir}/checkpoints/dataset_{jax.process_index()}",
     max_to_keep=cfg.keep_checkpoints,
   )
   dataset_manager.restore_or_initialize()
-
-  # replicate parameters to each device
   train_state = flax.jax_utils.replicate(train_state)
 
   for step in range(step, cfg.train_steps):
@@ -429,7 +411,6 @@ def train():
       if val_loss < best_val_loss:
         best_val_loss = val_loss
         if jax.process_index() == 0:
-          # save train state in process 0
           flax.training.checkpoints.save_checkpoint(
             f"{cfg.out_dir}/checkpoints/train_state",
             flax.jax_utils.unreplicate(train_state),
@@ -443,7 +424,7 @@ def train():
         wandb.log({"val/loss": val_loss}, step=step)
 
     tokens = next(train_iter)._numpy()
-    loss, train_state = train_step(train_state, tokens, keys_dropout)
+    loss, train_state = train_step(train_state, tokens, rng_dropout)
 
     if (cfg.wandb is not None) and (jax.process_index() == 0):
       wandb.log(
