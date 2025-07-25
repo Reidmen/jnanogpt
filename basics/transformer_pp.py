@@ -60,7 +60,7 @@ static_compatible_dataclass = lambda cls: jax.tree_util.register_static(dataclas
 @static_compatible_dataclass
 class ModelConfig:
   # data config
-  batch_size: int = 8
+  batch_size: int = 128
   seq_len: int = 32
 
   # model config
@@ -197,7 +197,7 @@ class MLPBlock(nnx.Module):
     x = nnx.LayerNorm(dtype=self.cfg.dtype, name="pre_norm")(x)
     x = nnx.Dense(features=self.cfg.hidden_size * self.cfg.mlp_expansion, dtype=self.cfg.dtype, name="input_dense")(x)
     x = nnx.silu(x)
-    x = nnx.Dense(features=hidden_dim, dtype=self.cfg.dtype, name="output_layer")(x) 
+    x = nnx.Dense(features=hidden_dim, dtype=self.cfg.dtype, name="output_layer")(x)
     x = nnx.Dropout(rate=self.cfg.dropout_rate, deterministic=not self.train)(x)
     return x + residual
 
@@ -251,10 +251,10 @@ def dot_product_attention(
   hidden_dim = q.shape[-1]
   scale = hidden_dim ** (-0.5)
   q = q * scale
-  q, k = q.astype(dtype), k.astype(dtype)  # upcast for precisio
+  q, k = q.astype(dtype), k.astype(dtype)  # upcast for precision
   logits = jnp.einsum("...qhd,...khd->...hqk", q, k)
-  if mask is not None:
-    logits = jnp.where(mask, logits, jnp.finfo(dtype).min)
+  # if mask is not None:
+  #   logits = jnp.where(mask, logits, jnp.finfo(dtype).min)
   logits = jax.nn.softmax(logits, axis=-1)
   logits = logits.astype(v.dtype)  # downcast
   attn = jnp.einsum("...hqk,...khd->...qhd", logits, v).astype(v.dtype)
@@ -387,8 +387,8 @@ def unstack_params(params: Pytree, axis_name: str) -> Pytree:
   return jax.tree_util.tree_map(_unstack, params, is_leaf=lambda x: isinstance(x, nnx.Partitioned))
 
 
-@jax.named_scope("pipeline_step")
-def pipeline_step(
+@jax.named_scope("execute_pipeline_step")
+def execute_pipeline_step(
   module: nnx.Module, state: jax.Array, input: jax.Array, *args, model_axis_name: str, **kwargs
 ) -> tuple[jax.Array, jax.Array]:
   num_stages = jax.lax.psum(1, axis_name=model_axis_name)  # find the total stages
@@ -422,7 +422,7 @@ def execute_pipeline(
   num_iterations = input_array.shape[0]
 
   _, outputs = nnx.scan(
-    partial(pipeline_step, *args, model_axis_name=model_axis_name, **kwargs),
+    partial(execute_pipeline_step, *args, model_axis_name=model_axis_name, **kwargs),
     variable_broadcast={"params": True},
     split_rngs={"params": False, "dropout": True},
     length=num_iterations,
@@ -491,12 +491,12 @@ class ParallelTransformer(nnx.Module):
       num_microbatches=self.cfg.optimizer.num_microbatches,
       module_fn=stage_module_fn,
     )
-    x = ModelParallelismModule(
-      module_fn=pipeline_module_fn, axis_name=self.cfg.model.model_axis_name, name="pipeline"
-    )(x)
+    x = ModelParallelismModule(module_fn=pipeline_module_fn, axis_name=self.cfg.model.model_axis_name, name="pipeline")(
+      x
+    )
     # Output -- Only needed for the last stage
     parallelism_module = partial(
-      ModelParallelismModule, axis_name=self.cfg.model.model_axis_name, mask_except_idx=self.cfg.model_axis_size
+      ModelParallelismModule, axis_name=self.cfg.model.model_axis_name, mask_except_idx=self.cfg.model_axis_size - 1
     )
     x = parallelism_module(module_fn=partial(nnx.LayerNorm, dtype=self.cfg.model.dtype), name="output_norm")(x)
     x = parallelism_module(
