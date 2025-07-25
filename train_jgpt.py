@@ -83,15 +83,26 @@ class ModelConfig:
 
 
 @static_compatible_dataclass
-class OptimizerConfig:
+class CosineDecayConfig:
+  init_value: float = 0.0
+  peak_value: float = 2.5e-4
+  warmup_steps: int = 2000
+  decay_steps: int = 150000
+  end_value: float = 1e-5
+
+@static_compatible_dataclass
+class TrainConfig:
   learning_date: float = 4e-4
   num_minibatches: int = 4
+  grad_clip: float = 1.0 
+  gradient_accumulation_steps: int = 1000
+  cosine_decay_config: CosineDecayConfig = dataclasses.field(default_factory=CosineDecayConfig)
 
 
 @static_compatible_dataclass
 class Config:
   model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
-  optimizer: OptimizerConfig = dataclasses.field(default_factory=OptimizerConfig)
+  optimizer: TrainConfig = dataclasses.field(default_factory=TrainConfig)
   seed: int = 32
 
 
@@ -280,48 +291,6 @@ class GPTModel(nnx.Module):
 
 ## Train
 
-
-@dataclasses.dataclass(frozen=True)
-class WandbConfig:
-  entity: str = "reidmen"
-  project: str = "todo"
-  name: str = "test"
-  mode: str = "disabled"
-  notes: str = ""
-
-
-@dataclasses.dataclass(frozen=True)
-class CosineDecayScheduleConfig:
-  init_value: float = 0.0
-  peak_value: float = 2.5e-4
-  warmup_steps: int = 2000
-  decay_steps: int = 150000
-  end_value: float = 1e-5
-
-
-@dataclasses.dataclass(frozen=True)
-class TrainConfig:
-  seed: int = 32
-  outdit: str = "./results"
-  train_pattern: str = "train_??.tfrecord"
-  val_pattern: str = "val_??.tfrecord"
-  shuffle_buffer_size: int = 12
-  eval_interval: int = 500
-  eval_steps: int = 16
-  eval_only: bool = False
-  keep_checkpoints: int = 3
-  batch_size: int = 16
-  train_steps: int = 150000
-  weight_decay: float = 1e-2
-  grad_clip: float = 1.0
-  gradient_accumulation_steps: int = 1
-  betas: tuple[float, float] = (0.9, 0.95)  # adamw betas
-  learning_rate: CosineDecayScheduleConfig = dataclasses.field(default_factory=CosineDecayScheduleConfig)
-  wandb: WandbConfig = dataclasses.field(default_factory=WandbConfig)
-  model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
-  # remat: bool = False
-
-
 def train_step(state: TrainState, tokens: jax.Array, dropout_key: jax.random.PRNGKey) -> tuple[jax.Array, TrainState]:
   # dropout_key = jax.random.fold_in(dropout_key, state.step)
 
@@ -361,7 +330,7 @@ def init_train_state(
   params = model.init(key, input)
   optimizer = optax.chain(
     optax.clip_by_global_norm(cfg.grad_clip),
-    optax.adamw(lr, *cfg.betas, weight_decay=cfg.weight_decay),
+    optax.adamw(lr),
     optax.apply_every(cfg.gradient_accumulation_steps),
   )
   train_state = TrainState.create(rng=key, apply_fn=model.apply, params=params, tx=optimizer)
@@ -394,7 +363,7 @@ def test_train():
   init_tokens = jax.random.randint(input_rng, (batch_size, seq_len), minval=0, maxval=cfg.vocab_size)
   _, key_params, key_dropout = jax.random.split(rng, 3)
   train_cfg = TrainConfig()
-  learning_rate = optax.warmup_cosine_decay_schedule(**dataclasses.asdict(train_cfg.learning_rate))
+  learning_rate = optax.warmup_cosine_decay_schedule(**dataclasses.asdict(train_cfg.cosine_decay_config))
   train_state = init_train_state(model, key_params, init_tokens, learning_rate, train_cfg)
   loss, train_state = jax.jit(train_step)(train_state, init_tokens, key_dropout)
   assert train_state.step == 1
