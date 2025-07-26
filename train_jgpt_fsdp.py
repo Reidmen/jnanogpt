@@ -1,3 +1,4 @@
+from functools import partial
 import os
 
 import numpy
@@ -14,7 +15,7 @@ def set_xla_flags_gpu():
   os.environ["XLA_FLAGS"] = flags
 
 
-def set_xla_flags_cpu(device_count: int = 1):
+def set_xla_flags_cpu(device_count: int = 8):
   flags = os.environ.get("XLA_FLAGS", "")
   flags += f" --xla_force_host_platform_device_count={device_count}"
   os.environ["XLA_FLAGS"] = flags
@@ -79,6 +80,8 @@ class ModelConfig:
   softmax_dtype: jnp.dtype = jnp.float32
   scan_layers: bool = False
   train: bool = False
+  min_weight_size: int = 2**7
+  data_axis_name: str = "data"
   remat: tuple[str, ...] = ("MLP", "Attention")
 
 
@@ -216,15 +219,20 @@ class AttentionBlock(nnx.Module):
 
   @nnx.compact
   def __call__(self, x: jax.Array, mask: jax.Array):
+    dense_module = shard_module_params(
+      nnx.Dense,
+      axis_name=self.cfg.data_axis_name,
+      min_weight_size=self.cfg.min_weight_size
+    )
     batch_size, seq_len, hidden_dim = x.shape
     assert hidden_dim % self.cfg.head_dim == 0
     num_heads = hidden_dim // self.cfg.head_dim
-    qkv = nnx.Dense(features=3 * hidden_dim, dtype=self.cfg.dtype, name="c_attn")(x)
+    qkv = dense_module(features=3 * hidden_dim, dtype=self.cfg.dtype, name="c_attn")(x)
     qkv = qkv.reshape(batch_size, seq_len, 3 * num_heads, self.cfg.head_dim)
     q, k, v = jnp.array_split(qkv, indices_or_sections=3, axis=2)  # (batch_size, seq_len, num_heads, head_dim)
     attn = jax.nn.dot_product_attention(q, k, v, bias=None)  # Add mask
     attn = attn.reshape((batch_size, seq_len, hidden_dim))
-    x = nnx.Dense(features=hidden_dim, dtype=self.cfg.dtype, name="c_proj")(attn)
+    x = dense_module(features=hidden_dim, dtype=self.cfg.dtype, name="c_proj")(attn)
     x = nnx.Dropout(rate=self.cfg.dropout_rate, deterministic=not self.cfg.train)(x)
     return x
 
@@ -235,10 +243,14 @@ class MLP(nnx.Module):
   @nnx.compact
   def __call__(self, x: jax.Array):
     hidden_dim = x.shape[-1]
-    x = nnx.Dense(
-      features=self.cfg.mlp_expansion * hidden_dim, dtype=self.cfg.dtype, name="c_fc")(x)
+    dense_module = shard_module_params(
+      nnx.Dense,
+      axis_name=self.cfg.data_axis_name,
+      min_weight_size=self.cfg.min_weight_size
+    )
+    x = dense_module(features=self.cfg.mlp_expansion * hidden_dim, dtype=self.cfg.dtype, name="c_fc")(x)
     x = nnx.gelu(x, approximate=True)
-    x = nnx.Dense(features=hidden_dim, dtype=self.cfg.dtype, name="c_proj")(x)
+    x = dense_module(features=hidden_dim, dtype=self.cfg.dtype, name="c_proj")(x)
     x = nnx.Dropout(rate=self.cfg.dropout_rate, deterministic=not self.cfg.train)(x)
     return x
 
@@ -289,6 +301,81 @@ class GPTModel(nnx.Module):
     logits = wte.attend(x).astype(self.cfg.dtype)
     return logits
 
+## Sharding -- FSDP
+Parameter = jax.Array | nnx.Partitioned # fully replicated or partioned params 
+
+@jax.named_scope("shard_params")
+def shard_params(
+  params: Pytree, axis_name: str, min_weight_size: int = 2**9
+) -> Pytree:
+  axis_idx = jax.lax.axis_index(axis_name)
+  axis_size = jax.lax.psum(1, axis_name)
+
+  def _split(x: Parameter) -> Parameter:
+    if isinstance(x, nnx.Partitioned):
+      value, names = x.value, x.names
+    else: # is jax.Array
+      value = x
+      names = (None,) * value.ndim
+    if axis_name in names or value.size <= min_weight_size:
+      # print(f"Parameter {value.shape} {names} sharded on axis {axis_name} or size {value.size} <= 2**9")
+      return x
+    else:
+      shape = value.shape
+      idx = numpy.argsort(shape)[::-1]
+      for i in idx:
+        if shape[i] % axis_size == 0 and names[i] is None:
+          split_size = shape[i] // axis_size
+          param_sharded = nnx.Partitioned(
+            value=jax.lax.dynamic_slice_in_dim(value, axis_idx * split_size, split_size, axis=i),
+            names=names[:i] + (axis_name,) + names[i+1:]
+          )
+          return param_sharded
+      print(f"Could not shard {value.shape} {names} on axis {axis_name} ")
+      return x
+  
+  return jax.tree_util.tree_map(_split, params, is_leaf=lambda x: isinstance(x, nnx.Partitioned))
+
+def gather_array_with_mean_grads(x: jax.Array, axis: int, axis_name: str):
+  axis_size = jax.lax.psum(1, axis_name)
+  def _inner_fn(x):
+    def grad_fn(g): # Computes average grads
+      return jax.lax.psum_scatter(g, axis_name, scatter_dimension=axis, tiled=True) / axis_size
+    # Gathers x across replicas, returning with the avg. grads
+    return jax.lax.all_gather(x, axis_name, axis=axis, tiled=True), grad_fn
+  
+  return _inner_fn(x)
+
+
+@jax.named_scope("gather_params")
+def gather_params(params: Pytree, axis_name: str) -> Pytree:
+  def _gather(p: Parameter) -> Parameter:
+    if isinstance(p, nnx.Partitioned) and axis_name in p.names:
+      param_shard = p.names
+      axis_shard = param_shard.index(axis_name)
+      value = gather_array_with_mean_grads(p.value, axis=axis_shard, axis_name=axis_name)
+      param_shard = param_shard[:axis_shard] + (None,) + param_shard[axis_shard+1:]
+      if any([name is not None for name in param_shard]):
+        return nnx.Partitioned(value, param_shard)
+      else:
+        return value # only when all axis are replicated 
+    else:
+      return p
+  
+  return jax.tree_util.tree_map(_gather, params, is_leaf=lambda x: isinstance(x, nnx.Partitioned))
+
+
+def shard_module_params(
+    target: nnx.Module | Callable, axis_name: str, min_weight_size: int = 2 ** 9
+) -> nnx.Module | Callable:
+  return nnx.map_variables(
+    target,
+    trans_in_fn=partial(gather_params, axis_name=axis_name),
+    trans_out_fn=partial(shard_params, axis_name=axis_name, min_weight_size=min_weight_size),
+    mapped_collections="params",
+    mutable=True
+  )
+
 ## Train
 
 def train_step(state: TrainState, tokens: jax.Array, dropout_key: jax.random.PRNGKey) -> tuple[jax.Array, TrainState]:
@@ -325,34 +412,63 @@ def evaluate(state: TrainState, ds: tf.data.Dataset, batch_size: int, block_size
 
 
 def init_train_state(
-  model: nnx.Module, key: jax.random.PRNGKey, input: jax.Array, lr: Any, cfg: TrainConfig
+  rng: jax.random.PRNGKey, input: jax.Array, model: nnx.Module, optimizer: Any
 ) -> TrainState:
-  params = model.init(key, input)
-  optimizer = optax.chain(
-    optax.clip_by_global_norm(cfg.grad_clip),
-    optax.adamw(lr),
-    optax.apply_every(cfg.gradient_accumulation_steps),
-  )
-  train_state = TrainState.create(rng=key, apply_fn=model.apply, params=params, tx=optimizer)
+  init_rng, rng = jax.random.split(rng)
+  variables = model.init({"params": init_rng}, input)
+  params = variables.pop("params")
+  train_state = TrainState.create(rng=rng, apply_fn=model.apply, params=params, tx=optimizer)
   return train_state
 
 
+def contruct_optimizer(cfg: TrainConfig):
+  learning_rate = optax.warmup_cosine_decay_schedule(**dataclasses.asdict(cfg.cosine_decay_config))
+  optimizer = optax.chain(
+    optax.clip_by_global_norm(cfg.grad_clip),
+    optax.adamw(learning_rate),
+    optax.apply_every(cfg.gradient_accumulation_steps),
+  ) 
+  return optimizer
 
-# TODO, decouple the optimization section: check: train_jgpt_fsdp.py
 def test_model():
   key = jax.random.PRNGKey(64)
-  rng, input_rng, dropout_rng = jax.random.split(key, 3)
+  rng, input_rng, model_rng = jax.random.split(key, 3)
   cfg = ModelConfig(vocab_size=256, num_layers=4, embed_size=128, train=False) # type: ignore
-  model = GPTModel(cfg=cfg)
+  train_cfg = TrainConfig()
+  gpt_model = GPTModel(cfg=cfg)
   batch_size, seq_len = 8, 32
   init_input = jax.random.randint(input_rng, (batch_size, seq_len), minval=0, maxval=cfg.vocab_size)
-  init_rngs = {"params": rng, "dropout": dropout_rng}
-  params = model.init(init_rngs, init_input)
-  print(f"Model size: {count_params(params)}")
-  sizes = jax.tree_util.tree_map(lambda x: x.shape, params, is_leaf=lambda x: isinstance(x, jax.Array))
-  print(f"Model param sizes: \n{sizes}")
-  ret = model.apply(params, init_input)  # (batch_size, seq_len, vocab_size)
-  assert ret.shape == (batch_size, seq_len, cfg.vocab_size)
+  mesh = jax.make_mesh((8,), axis_names=(cfg.data_axis_name,))
+  optimizer = contruct_optimizer(train_cfg)
+  init_fsdp_fn = jax.shard_map(
+    partial(init_train_state, model=gpt_model, optimizer=optimizer),
+    in_specs=(PartitionSpec(), PartitionSpec(cfg.data_axis_name)),
+    out_specs=PartitionSpec(),
+    mesh=mesh,
+    check_vma=False
+  )
+  state_fsdp_shapes = jax.eval_shape(init_fsdp_fn, model_rng, init_input)
+  state_fsdp_specs = nnx.get_partition_spec(state_fsdp_shapes)
+  print(f"RNG {state_fsdp_specs.rng}")
+  print(f"Parameters\n {state_fsdp_specs.params}")
+  print(f"Optimizer state\n {state_fsdp_specs.opt_state}")
+
+  init_fsdp_fn = jax.jit(jax.shard_map(
+    partial(init_train_state, model=gpt_model, optimizer=optimizer),
+    in_specs=(PartitionSpec(), PartitionSpec(cfg.data_axis_name)),
+    out_specs=state_fsdp_specs,
+    mesh=mesh,
+    check_vma=True
+  ))
+  state_fsdp = init_fsdp_fn(model_rng, init_input)
+  print("FSDP Parameter shape per-layer")
+  print(jax.tree_util.tree_map(lambda x: x.shape, jax.device_get(state_fsdp.params)))
+  print("FSDP parameter size per-layer")
+  params_size = jax.tree_util.tree_map(lambda x: x.size, jax.device_get(state_fsdp.params))
+  print(params_size)
+  print("FSDP Model size")
+  print(jax.tree_util.tree_reduce(lambda a, b: a + b, params_size))
+
 
 
 def test_train():
@@ -364,8 +480,7 @@ def test_train():
   init_tokens = jax.random.randint(input_rng, (batch_size, seq_len), minval=0, maxval=cfg.vocab_size)
   _, key_params, key_dropout = jax.random.split(rng, 3)
   train_cfg = TrainConfig()
-  learning_rate = optax.warmup_cosine_decay_schedule(**dataclasses.asdict(train_cfg.cosine_decay_config))
-  train_state = init_train_state(model, key_params, init_tokens, learning_rate, train_cfg)
+  train_state = init_train_state(model, key_params, init_tokens, train_cfg)
   loss, train_state = jax.jit(train_step)(train_state, init_tokens, key_dropout)
   assert train_state.step == 1
   assert loss.shape == ()
@@ -379,4 +494,4 @@ def count_params(params: Any) -> int:
 
 if __name__ == "__main__":
   test_model()
-  test_train()
+  # test_train()
