@@ -270,7 +270,7 @@ class TransformerBlock(nnx.Module):
     mlp_block = MLP
     if "MLP" in self.cfg.remat:
       mlp_block = nnx.remat(mlp_block, prevent_cse=False)
-    x = mlp_block(self.cfg)(x)
+    x = mlp_block(cfg=self.cfg)(x)
     return x
 
 
@@ -291,8 +291,8 @@ class GPTModel(nnx.Module):
     tok_embed = wte(idx)  # (batch_size, seq_len, num_embed)
     x = nnx.Dropout(rate=self.cfg.dropout_rate, deterministic=not self.cfg.train)(tok_embed + pos_embed)
     # TODO: nnx.scan
-    # for i in range(self.cfg.num_layers):
-    #   x = TransformerBlock(self.cfg, name=f"block_{i}")(x, attn_mask)
+    for i in range(self.cfg.num_layers):
+      x = TransformerBlock(self.cfg, name=f"block_{i}")(x, attn_mask)
     x = nnx.LayerNorm(
       self.cfg.epsilon, dtype=self.cfg.dtype, name="ln_f"
     )(x)
@@ -336,6 +336,8 @@ def shard_params(
 
 def gather_array_with_mean_grads(x: jax.Array, axis: int, axis_name: str):
   axis_size = jax.lax.psum(1, axis_name)
+
+  @jax.custom_gradient
   def _inner_fn(x):
     def grad_fn(g): # Computes average grads
       return jax.lax.psum_scatter(g, axis_name, scatter_dimension=axis, tiled=True) / axis_size
