@@ -1,8 +1,6 @@
 from functools import partial
 import os
 
-import numpy
-
 def set_xla_flags_gpu():
   flags = os.environ.get("XLA_FLAGS", "")
   flags += (
@@ -44,7 +42,9 @@ import flax
 import optax
 import tensorflow as tf
 from flax.training import train_state as flax_train_state
+import flax.struct as fstruct
 import flax.linen as nnx
+import numpy
 import dataclasses
 
 Pytree = Any
@@ -59,7 +59,7 @@ def create_named_sharding(mesh, args: tuple[str | None,...]):
 
 
 # Configs
-static_compatible_dataclass = lambda cls: tree_util.register_static(dataclasses.dataclass(cls)) # type: ignore
+static_compatible_dataclass = lambda cls: tree_util.register_static(dataclasses.dataclass(cls, frozen=True)) # type: ignore
 
 @static_compatible_dataclass
 class ModelConfig:
@@ -113,7 +113,7 @@ class TrainState(flax_train_state.TrainState):
   rng: jax.Array
 
 
-@static_compatible_dataclass
+@fstruct.dataclass
 class Batch:
   inputs: jax.Array
   labels: jax.Array
@@ -139,8 +139,6 @@ def accumulate_gradients_loop(
         grads = jax.tree_util.tree_map(jnp.add, grads, step_grads)  # grads += step_grads
         metrics = jax.tree_util.tree_map(jnp.add, metrics, step_metrics)
   grads = jax.tree_util.tree_map(lambda g: g / num_minbatches, grads)
-  if metrics is None:
-    raise ValueError
 
   return grads, metrics
 
@@ -217,20 +215,22 @@ class AttentionBlock(nnx.Module):
 
   @nnx.compact
   def __call__(self, x: jax.Array, mask: jax.Array):
+    batch_size, seq_len, _ = x.shape
+    assert self.cfg.hidden_size % self.cfg.head_dim == 0
+    num_heads = self.cfg.hidden_size // self.cfg.head_dim
+    hidden_size = self.cfg.hidden_size
+
     dense_module = shard_module_params(
       nnx.Dense,
       axis_name=self.cfg.data_axis_name,
       min_weight_size=self.cfg.min_weight_size
     )
-    batch_size, seq_len, hidden_dim = x.shape
-    assert hidden_dim % self.cfg.head_dim == 0
-    num_heads = hidden_dim // self.cfg.head_dim
-    qkv = dense_module(features=3 * hidden_dim, dtype=self.cfg.dtype, name="c_attn")(x)
+    qkv = dense_module(features=3 * hidden_size, dtype=self.cfg.dtype, name="c_attn")(x)
     qkv = qkv.reshape(batch_size, seq_len, 3 * num_heads, self.cfg.head_dim)
     q, k, v = jnp.array_split(qkv, indices_or_sections=3, axis=2)  # (batch_size, seq_len, num_heads, head_dim)
-    attn = jax.nn.dot_product_attention(q, k, v, bias=None)  # Add mask
-    attn = attn.reshape((batch_size, seq_len, hidden_dim))
-    x = dense_module(features=hidden_dim, dtype=self.cfg.dtype, name="c_proj")(attn)
+    attn = jax.nn.dot_product_attention(q, k, v, bias=None)  # add mask
+    attn = attn.reshape((batch_size, seq_len, hidden_size))
+    x = dense_module(features=self.cfg.embed_size, dtype=self.cfg.dtype, name="c_proj")(attn)
     x = nnx.Dropout(rate=self.cfg.dropout_rate, deterministic=not self.cfg.train)(x)
     return x
 
@@ -240,15 +240,15 @@ class MLP(nnx.Module):
 
   @nnx.compact
   def __call__(self, x: jax.Array):
-    hidden_dim = x.shape[-1]
+    hidden_size = self.cfg.hidden_size
     dense_module = shard_module_params(
       nnx.Dense,
       axis_name=self.cfg.data_axis_name,
       min_weight_size=self.cfg.min_weight_size
     )
-    x = dense_module(features=self.cfg.mlp_expansion * hidden_dim, dtype=self.cfg.dtype, name="c_fc")(x)
+    x = dense_module(features=self.cfg.mlp_expansion * hidden_size, dtype=self.cfg.dtype, name="c_fc")(x)
     x = nnx.gelu(x, approximate=True)
-    x = dense_module(features=hidden_dim, dtype=self.cfg.dtype, name="c_proj")(x)
+    x = dense_module(features=self.cfg.embed_size, dtype=self.cfg.dtype, name="c_proj")(x)
     x = nnx.Dropout(rate=self.cfg.dropout_rate, deterministic=not self.cfg.train)(x)
     return x
 
@@ -258,7 +258,7 @@ class TransformerBlock(nnx.Module):
 
   @nnx.compact
   def __call__(self, x: jax.Array, mask: jax.Array):
-    residual = x  # (batch_size, seq_len, hidden_dim)
+    residual = x  # (batch_size, seq_len, num_embed)
     # Attention block
     x = nnx.LayerNorm(epsilon=self.cfg.epsilon, dtype=self.cfg.dtype)(x)
     attn_block = AttentionBlock 
@@ -291,8 +291,8 @@ class GPTModel(nnx.Module):
     tok_embed = wte(idx)  # (batch_size, seq_len, num_embed)
     x = nnx.Dropout(rate=self.cfg.dropout_rate, deterministic=not self.cfg.train)(tok_embed + pos_embed)
     # TODO: nnx.scan
-    for i in range(self.cfg.num_layers):
-      x = TransformerBlock(self.cfg, name=f"block_{i}")(x, attn_mask)
+    # for i in range(self.cfg.num_layers):
+    #   x = TransformerBlock(self.cfg, name=f"block_{i}")(x, attn_mask)
     x = nnx.LayerNorm(
       self.cfg.epsilon, dtype=self.cfg.dtype, name="ln_f"
     )(x)
@@ -409,8 +409,9 @@ def loss_fn(params: Pytree, apply_fn: Any, batch: Batch, rng: jax.Array, axis_na
 
 def train_step(state: TrainState, metrics: Metrics, batch: Batch, cfg: Config) -> tuple[TrainState, Metrics]:
   rng, step_rng = jax.random.split(state.rng)
+  loss_fn_with_axis = partial(loss_fn, axis_name=cfg.model.data_axis_name)
   grads, step_metrics = accumulate_gradients(
-    state, batch, step_rng, cfg.train.num_minibatches, loss_fn=partial(loss_fn, axis_name=cfg.model.data_axis_name)
+    state, batch, step_rng, cfg.train.num_minibatches, loss_fn_with_axis 
   )
   with jax.named_scope("synchronize_gradients"):
     grads = synchronize_gradients(grads, (cfg.model.data_axis_name,))
@@ -495,7 +496,7 @@ def test_train():
   init_inputs = jax.random.randint(input_rng, (batch_size, seq_len), minval=0, maxval=cfg.model.vocab_size)
   batch = Batch(
     inputs=init_inputs,# type: ignore
-    labels=jnp.pad(init_inputs, ((0, 0), (1, 0)))# type: ignore
+    labels=jnp.pad(init_inputs[:, :-1], ((0, 0), (1, 0)))# type: ignore
   )
   mesh = jax.make_mesh((8,), axis_names=(cfg.model.data_axis_name,))
   optimizer = contruct_optimizer(cfg.train)
@@ -524,24 +525,23 @@ def test_train():
   print(jax.tree_util.tree_reduce(lambda a, b: a + b, params_size))
 
   train_step_fsdp_fn = jax.jit(jax.shard_map(
-    train_step,
-    in_specs=(state_fsdp_specs, PartitionSpec(), PartitionSpec(cfg.model.data_axis_name), PartitionSpec()),
+    partial(train_step, cfg=cfg),
+    in_specs=(state_fsdp_specs, PartitionSpec(), PartitionSpec(cfg.model.data_axis_name)),
     out_specs=(state_fsdp_specs, PartitionSpec()),
     mesh=mesh,
     check_vma=False
   ),
-  donate_argnames=("state", "metrics", "cfg")
+  donate_argnames=("state", "metrics"),
+  static_argnames=("cfg",)
   )
-  _, metric_shapes = jax.eval_shape(train_step_fsdp_fn, state_fsdp, None, batch, cfg)
+  _, metric_shapes = jax.eval_shape(train_step_fsdp_fn, state_fsdp, None, batch)
   metrics_fsdp = jax.tree_util.tree_map(lambda x: jnp.zeros(x.shape, dtype=x.dtype), metric_shapes)
-
   for _ in range(10):
-    state_fsdp, metrics_fsdp = train_step_fsdp_fn(state_fsdp, metrics_fsdp, batch, cfg)
+    state_fsdp, metrics_fsdp = train_step_fsdp_fn(state_fsdp, metrics_fsdp, batch)
   final_metrics_fsdp = jax.tree_util.tree_map(lambda x: jnp.zeros(x.shape, dtype=x.dtype), metrics_fsdp)
-  state_fsdp, final_metrics_fsdp = train_step_fsdp_fn(state_fsdp, metrics_fsdp)
+  state_fsdp, final_metrics_fsdp = train_step_fsdp_fn(state_fsdp, metrics_fsdp, batch)
   print("FSDP - Final metrics")
   print(final_metrics_fsdp)
-
 
 
 
