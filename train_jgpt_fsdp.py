@@ -105,7 +105,7 @@ class TrainConfig:
 @static_compatible_dataclass
 class Config:
   model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
-  optimizer: TrainConfig = dataclasses.field(default_factory=TrainConfig)
+  train: TrainConfig = dataclasses.field(default_factory=TrainConfig)
   seed: int = 32
 
 
@@ -113,6 +113,7 @@ class TrainState(flax_train_state.TrainState):
   rng: jax.Array
 
 
+@static_compatible_dataclass
 class Batch:
   inputs: jax.Array
   labels: jax.Array
@@ -177,7 +178,7 @@ def accumulated_gradients_scan(
 def accumulate_gradients(
   state: TrainState,
   batch: Batch,
-  rng: jax.random.PRNGKey,
+  rng: jax.Array,
   num_minbatches: int,
   loss_fn: Callable,
   use_scan: bool = False,
@@ -187,9 +188,6 @@ def accumulate_gradients(
   else:
     return accumulate_gradients_loop(state, batch, loss_fn, num_minbatches, rng)
 
-
-def get_num_params(state: TrainState) -> int:
-  return sum(numpy.prod(x.shape) for x in jax.tree_util.tree_leaves(state.params))
 
 
 def dot_product_attention(
@@ -376,43 +374,57 @@ def shard_module_params(
     mutable=True
   )
 
-## Train
 
-def train_step(state: TrainState, tokens: jax.Array, dropout_key: jax.random.PRNGKey) -> tuple[jax.Array, TrainState]:
-  # dropout_key = jax.random.fold_in(dropout_key, state.step)
+def synchronize_gradients(grads: Pytree, axis_names: tuple[str,...]) -> Pytree:
+  """Synchronize gradients across devices."""
+  def _sync_grad(g: Parameter):
+    if isinstance(g, nnx.Partitioned):
+      replication_axis_names = [
+        name for name in axis_names if name not in jax.tree_util.tree_leaves(g.names)
+      ]
+      if len(replication_axis_names) == 0: # parameters partitioned over all axes 
+        return g
+      else: # avg over remaining replicated axes
+        return g.replace(value=jax.lax.pmean(g.value, axis_name=replication_axis_names))
+    else: # parameters are replicated over all axes
+      return jax.lax.pmean(g, axis_name=axis_names)
+  return jax.tree_util.tree_map(_sync_grad, grads, is_leaf=lambda x: isinstance(x, nnx.Partitioned))
 
-  def _loss(params: flax.core.FrozenDict) -> jax.Array:
-    X, Y = tokens[:, :-1], tokens[:, 1:]
-    logits = state.apply_fn(params, X, rngs={'dropout': dropout_key})
-    loss = optax.softmax_cross_entropy_with_integer_labels(logits, Y).mean()
-    return loss
+## Train 
 
-  loss, grads = jax.value_and_grad(_loss, has_aux=False)(state.params)  # per-device
-  # grads = jax.lax.pmean(grads, axis_name="batch")
-  # loss = jax.lax.pmean(loss, axis_name="batch")
-  new_state = state.apply_gradients(grads=grads)
-  return loss, new_state
+def fold_rng_over_axis(rng: jax.Array, axis_name: str) -> jax.Array: # PRNG
+  axis_index = jax.lax.axis_index(axis_name)
+  return jax.random.fold_in(rng, axis_index)
 
-
-def eval_step(state: TrainState, tokens: jnp.ndarray) ->jax.Array: 
-  X, Y = tokens[:, :-1], tokens[:, 1:]
-  logits = state.apply_fn(state.params, X, True)
-  loss = optax.softmax_cross_entropy_with_integer_labels(logits, Y)
-  # loss = jax.lax.pmean(loss, axis_name="batch")
-  return loss
+def loss_fn(params: Pytree, apply_fn: Any, batch: Batch, rng: jax.Array, axis_name: str) -> tuple[jax.Array, dict[str, Any]]:
+  dropout_rng = fold_rng_over_axis(rng, axis_name)
+  # apply_fn comes from state.apply_fn
+  logits = apply_fn({"params": params}, batch.inputs, rngs={"dropout": dropout_rng})
+  loss = optax.softmax_cross_entropy_with_integer_labels(logits, batch.labels)
+  corrected_pred = jnp.equal(jnp.argmax(logits, axis=-1), batch.labels)
+  batch_size = batch.inputs.shape[0]
+  step_metrics = {"loss": (loss.sum(), batch_size), "accuracy": (corrected_pred.sum(), batch_size)}
+  return loss.mean(), step_metrics
 
 
-def evaluate(state: TrainState, ds: tf.data.Dataset, batch_size: int, block_size: int, steps: int) -> jnp.ndarray:
-  losses = []
-  for _, tokens in zip(range(steps), ds):
-    tokens = tokens._numpy()
-    loss = eval_step(state, tokens)
-    losses.append(loss)
-  return jnp.mean(jnp.stack(losses))
-
+def train_step(state: TrainState, metrics: Metrics, batch: Batch, cfg: Config) -> tuple[TrainState, Metrics]:
+  rng, step_rng = jax.random.split(state.rng)
+  grads, step_metrics = accumulate_gradients(
+    state, batch, step_rng, cfg.train.num_minibatches, loss_fn=partial(loss_fn, axis_name=cfg.model.data_axis_name)
+  )
+  with jax.named_scope("synchronize_gradients"):
+    grads = synchronize_gradients(grads, (cfg.model.data_axis_name,))
+  new_state = state.apply_gradients(grads=grads, rng=rng)
+  with jax.named_scope("synchronize_metrics"):
+    step_metrics = jax.tree_util.tree_map(lambda x: jax.lax.psum(x, axis_name=cfg.model.data_axis_name), step_metrics)
+  if metrics is None:
+    metrics = step_metrics
+  else:
+    metrics = jax.tree_util.tree_map(jnp.add, metrics, step_metrics)
+  return new_state, metrics
 
 def init_train_state(
-  rng: jax.random.PRNGKey, input: jax.Array, model: nnx.Module, optimizer: Any
+  rng: jax.Array, input: jax.Array, model: nnx.Module, optimizer: Any
 ) -> TrainState:
   init_rng, rng = jax.random.split(rng)
   variables = model.init({"params": init_rng}, input)
@@ -422,7 +434,7 @@ def init_train_state(
 
 
 def contruct_optimizer(cfg: TrainConfig):
-  learning_rate = optax.warmup_cosine_decay_schedule(**dataclasses.asdict(cfg.cosine_decay_config))
+  learning_rate = optax.warmup_cosine_decay_schedule(**dataclasses.asdict(cfg.cosine_decay_config)) # type: ignore
   optimizer = optax.chain(
     optax.clip_by_global_norm(cfg.grad_clip),
     optax.adamw(learning_rate),
@@ -472,18 +484,64 @@ def test_model():
 
 
 def test_train():
-  cfg = ModelConfig(vocab_size=256, num_layers=4, embed_size=32, train=True) # type: ignore
-  init_rng = jax.random.PRNGKey(32)
-  rng, input_rng = jax.random.split(init_rng, 2)
-  model = GPTModel(cfg=cfg)
+  key = jax.random.PRNGKey(64)
+  rng, input_rng, model_rng = jax.random.split(key, 3)
+  cfg = Config(
+    model=ModelConfig(vocab_size=256, num_layers=4, embed_size=128, train=True), # type: ignore 
+    train=TrainConfig() # type: ignore
+  )
+  gpt_model = GPTModel(cfg=cfg.model)
   batch_size, seq_len = 8, 32
-  init_tokens = jax.random.randint(input_rng, (batch_size, seq_len), minval=0, maxval=cfg.vocab_size)
-  _, key_params, key_dropout = jax.random.split(rng, 3)
-  train_cfg = TrainConfig()
-  train_state = init_train_state(model, key_params, init_tokens, train_cfg)
-  loss, train_state = jax.jit(train_step)(train_state, init_tokens, key_dropout)
-  assert train_state.step == 1
-  assert loss.shape == ()
+  init_inputs = jax.random.randint(input_rng, (batch_size, seq_len), minval=0, maxval=cfg.model.vocab_size)
+  batch = Batch(
+    inputs=init_inputs,# type: ignore
+    labels=jnp.pad(init_inputs, ((0, 0), (1, 0)))# type: ignore
+  )
+  mesh = jax.make_mesh((8,), axis_names=(cfg.model.data_axis_name,))
+  optimizer = contruct_optimizer(cfg.train)
+  init_fsdp_fn = jax.shard_map(
+    partial(init_train_state, model=gpt_model, optimizer=optimizer),
+    in_specs=(PartitionSpec(), PartitionSpec(cfg.model.data_axis_name)),
+    out_specs=PartitionSpec(),
+    mesh=mesh,
+    check_vma=False
+  )
+  state_fsdp_shapes = jax.eval_shape(init_fsdp_fn, model_rng, batch.inputs)
+  state_fsdp_specs = nnx.get_partition_spec(state_fsdp_shapes)
+  print(f"RNG {state_fsdp_specs.rng}")
+  print(f"Parameters\n {state_fsdp_specs.params}")
+
+  init_fsdp_fn = jax.jit(jax.shard_map(
+    partial(init_train_state, model=gpt_model, optimizer=optimizer),
+    in_specs=(PartitionSpec(), PartitionSpec(cfg.model.data_axis_name)),
+    out_specs=state_fsdp_specs,
+    mesh=mesh,
+    check_vma=True
+  ))
+  state_fsdp = init_fsdp_fn(model_rng, batch.inputs)
+  params_size = jax.tree_util.tree_map(lambda x: x.size, jax.device_get(state_fsdp.params))
+  print("FSDP Model size")
+  print(jax.tree_util.tree_reduce(lambda a, b: a + b, params_size))
+
+  train_step_fsdp_fn = jax.jit(jax.shard_map(
+    train_step,
+    in_specs=(state_fsdp_specs, PartitionSpec(), PartitionSpec(cfg.model.data_axis_name), PartitionSpec()),
+    out_specs=(state_fsdp_specs, PartitionSpec()),
+    mesh=mesh,
+    check_vma=False
+  ),
+  donate_argnames=("state", "metrics", "cfg")
+  )
+  _, metric_shapes = jax.eval_shape(train_step_fsdp_fn, state_fsdp, None, batch, cfg)
+  metrics_fsdp = jax.tree_util.tree_map(lambda x: jnp.zeros(x.shape, dtype=x.dtype), metric_shapes)
+
+  for _ in range(10):
+    state_fsdp, metrics_fsdp = train_step_fsdp_fn(state_fsdp, metrics_fsdp, batch, cfg)
+  final_metrics_fsdp = jax.tree_util.tree_map(lambda x: jnp.zeros(x.shape, dtype=x.dtype), metrics_fsdp)
+  state_fsdp, final_metrics_fsdp = train_step_fsdp_fn(state_fsdp, metrics_fsdp)
+  print("FSDP - Final metrics")
+  print(final_metrics_fsdp)
+
 
 
 
@@ -493,5 +551,5 @@ def count_params(params: Any) -> int:
 
 
 if __name__ == "__main__":
-  test_model()
-  # test_train()
+  # test_model()
+  test_train()

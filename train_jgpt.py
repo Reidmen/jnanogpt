@@ -54,10 +54,7 @@ def create_named_sharding(mesh, args: tuple[str | None,...]):
 
 
 ## Model
-
-
-
-# Configs
+###  Configs
 static_compatible_dataclass = lambda cls: tree_util.register_static(dataclasses.dataclass(cls)) # type: ignore
 
 @static_compatible_dataclass
