@@ -88,17 +88,17 @@ class ModelConfig:
 @static_compatible_dataclass
 class CosineDecayConfig:
   init_value: float = 0.0
-  peak_value: float = 2.5e-4
-  warmup_steps: int = 2000
-  decay_steps: int = 150000
-  end_value: float = 1e-5
+  peak_value: float = 1.0 # 2.5e-4
+  warmup_steps: int = 2 # 2000
+  decay_steps: int = 5 # 150000
+  end_value: float = 1e-4 # 1e-5
 
 @static_compatible_dataclass
 class TrainConfig:
-  learning_date: float = 4e-4
-  num_minibatches: int = 4
+  learning_date: float = 1e-3 #4e-4
+  num_minibatches: int = 2 
   grad_clip: float = 1.0 
-  gradient_accumulation_steps: int = 1000
+  gradient_accumulation_steps: int = 1
   cosine_decay_config: CosineDecayConfig = dataclasses.field(default_factory=CosineDecayConfig)
 
 
@@ -120,7 +120,7 @@ class Batch:
 
 
 def accumulate_gradients_loop(
-  state: TrainState, batch: Batch, loss_fn: Callable, num_minbatches: int, rng: jax.random.PRNGKey
+  state: TrainState, batch: Batch, loss_fn: Callable, num_minbatches: int, rng: jax.Array
 ) -> tuple[Pytree, Metrics]:
   batch_size = batch.inputs.shape[0]
   minibatch_size = batch_size // num_minbatches
@@ -140,11 +140,11 @@ def accumulate_gradients_loop(
         metrics = jax.tree_util.tree_map(jnp.add, metrics, step_metrics)
   grads = jax.tree_util.tree_map(lambda g: g / num_minbatches, grads)
 
-  return grads, metrics
+  return grads, metrics # type: ignore
 
 
 def accumulated_gradients_scan(
-  state: TrainState, batch: Batch, loss_fn: Callable, num_minbatches: int, rng: jax.random.PRNGKey
+  state: TrainState, batch: Batch, loss_fn: Callable, num_minbatches: int, rng: jax.Array
 ) -> tuple[Pytree, Metrics]:
   batch_size = batch.inputs.shape[0]
   minibatch_size = batch_size // num_minbatches
@@ -409,7 +409,7 @@ def loss_fn(params: Pytree, apply_fn: Any, batch: Batch, rng: jax.Array, axis_na
   return loss.mean(), step_metrics
 
 
-def train_step(state: TrainState, metrics: Metrics, batch: Batch, cfg: Config) -> tuple[TrainState, Metrics]:
+def train_step(state: TrainState, metrics: Metrics | None, batch: Batch, cfg: Config) -> tuple[TrainState, Metrics]:
   rng, step_rng = jax.random.split(state.rng)
   loss_fn_with_axis = partial(loss_fn, axis_name=cfg.model.data_axis_name)
   grads, step_metrics = accumulate_gradients(
@@ -424,7 +424,7 @@ def train_step(state: TrainState, metrics: Metrics, batch: Batch, cfg: Config) -
     metrics = step_metrics
   else:
     metrics = jax.tree_util.tree_map(jnp.add, metrics, step_metrics)
-  return new_state, metrics
+  return new_state, metrics # type: ignore
 
 def init_train_state(
   rng: jax.Array, input: jax.Array, model: nnx.Module, optimizer: Any
@@ -491,11 +491,11 @@ def test_train():
   key = jax.random.PRNGKey(64)
   rng, input_rng, model_rng = jax.random.split(key, 3)
   cfg = Config(
-    model=ModelConfig(vocab_size=256, num_layers=4, embed_size=128, train=True), # type: ignore 
+    model=ModelConfig(vocab_size=128, num_layers=4, embed_size=64, train=True), # type: ignore 
     train=TrainConfig() # type: ignore
   )
   gpt_model = GPTModel(cfg=cfg.model)
-  batch_size, seq_len = 8, 32
+  batch_size, seq_len = 16, 32 
   init_inputs = jax.random.randint(input_rng, (batch_size, seq_len), minval=0, maxval=cfg.model.vocab_size)
   batch = Batch(
     inputs=init_inputs,# type: ignore
@@ -545,12 +545,16 @@ def test_train():
   )
   _, metric_shapes = jax.eval_shape(train_step_fsdp_fn, state_fsdp, None, batch)
   metrics_fsdp = jax.tree_util.tree_map(lambda x: jnp.zeros(x.shape, dtype=x.dtype), metric_shapes)
-  for _ in range(10):
+  for _ in range(100):
     state_fsdp, metrics_fsdp = train_step_fsdp_fn(state_fsdp, metrics_fsdp, batch)
+    print(f"Iteration {_}")
+    pprint(metrics_fsdp, indent=1)
+  # deltas = jax.tree_util.tree_map(lambda a, b: jnp.linalg.norm(a - b), old_prams, state-fsdp.params)
   final_metrics_fsdp = jax.tree_util.tree_map(lambda x: jnp.zeros(x.shape, dtype=x.dtype), metrics_fsdp)
   state_fsdp, final_metrics_fsdp = train_step_fsdp_fn(state_fsdp, final_metrics_fsdp, batch)
   print("FSDP - Final metrics")
   print(final_metrics_fsdp)
+  
 
 
 
