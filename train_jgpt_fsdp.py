@@ -187,7 +187,7 @@ def accumulate_gradients(
     return accumulate_gradients_loop(state, batch, loss_fn, num_minbatches, rng)
 
 
-
+# FIXME: remove, using jax.nn.dot_product_attention
 def dot_product_attention(
   q: jax.Array,  # (..., qseq_len, num_heads, hidden_dim)
   k: jax.Array,  # (..., kseq_len, num_heads, hidden_dim)
@@ -487,6 +487,7 @@ def test_model():
 
 
 def test_train():
+  from pprint import pprint
   key = jax.random.PRNGKey(64)
   rng, input_rng, model_rng = jax.random.split(key, 3)
   cfg = Config(
@@ -512,7 +513,11 @@ def test_train():
   state_fsdp_shapes = jax.eval_shape(init_fsdp_fn, model_rng, batch.inputs)
   state_fsdp_specs = nnx.get_partition_spec(state_fsdp_shapes)
   print(f"RNG {state_fsdp_specs.rng}")
-  print(f"Parameters\n {state_fsdp_specs.params}")
+  print("Parameters")
+  pprint(state_fsdp_specs.params, indent=1)
+  # print("Optimizer")
+  # pprint(state_fsdp_specs.opt_state[1][0])
+
 
   init_fsdp_fn = jax.jit(jax.shard_map(
     partial(init_train_state, model=gpt_model, optimizer=optimizer),
@@ -522,9 +527,11 @@ def test_train():
     check_vma=True
   ))
   state_fsdp = init_fsdp_fn(model_rng, batch.inputs)
+  print("Parameters shapes")
+  pprint(jax.tree_util.tree_map(lambda x: x.shape, jax.device_get(state_fsdp.params)))
+  
   params_size = jax.tree_util.tree_map(lambda x: x.size, jax.device_get(state_fsdp.params))
-  print("FSDP Model size")
-  print(jax.tree_util.tree_reduce(lambda a, b: a + b, params_size))
+  print(f"FSDP Model size: {jax.tree_util.tree_reduce(lambda a, b: a + b, params_size)}")
 
   train_step_fsdp_fn = jax.jit(jax.shard_map(
     partial(train_step, cfg=cfg),
@@ -541,7 +548,7 @@ def test_train():
   for _ in range(10):
     state_fsdp, metrics_fsdp = train_step_fsdp_fn(state_fsdp, metrics_fsdp, batch)
   final_metrics_fsdp = jax.tree_util.tree_map(lambda x: jnp.zeros(x.shape, dtype=x.dtype), metrics_fsdp)
-  state_fsdp, final_metrics_fsdp = train_step_fsdp_fn(state_fsdp, metrics_fsdp, batch)
+  state_fsdp, final_metrics_fsdp = train_step_fsdp_fn(state_fsdp, final_metrics_fsdp, batch)
   print("FSDP - Final metrics")
   print(final_metrics_fsdp)
 
