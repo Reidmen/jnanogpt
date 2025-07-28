@@ -281,7 +281,6 @@ class GPTModel(nnx.Module):
   def __call__(self, idx: jax.Array) -> jax.Array:
     _, seq_len = idx.shape
     position = jnp.arange(0, seq_len)[None, :] # (1, seq_len)
-    attn_mask = nnx.make_causal_mask(idx, dtype=bool)
     pos_embed = nnx.Embed(
       num_embeddings=self.cfg.vocab_size, features=self.cfg.embed_size, dtype=self.cfg.dtype, name="pos_embed"
     )(position)  # (vocab_size, embed_dim) (1, seq_len) -> (1, seq_len, num_embed)
@@ -291,6 +290,7 @@ class GPTModel(nnx.Module):
     tok_embed = wte(idx)  # (batch_size, seq_len, num_embed)
     x = nnx.Dropout(rate=self.cfg.dropout_rate, deterministic=not self.cfg.train)(tok_embed + pos_embed)
     # TODO: nnx.scan
+    attn_mask = nnx.make_causal_mask(x, dtype=jnp.bool)
     for i in range(self.cfg.num_layers):
       x = TransformerBlock(self.cfg, name=f"block_{i}")(x, attn_mask)
     x = nnx.LayerNorm(
@@ -358,7 +358,7 @@ def gather_params(params: Pytree, axis_name: str) -> Pytree:
       if any([name is not None for name in param_shard]):
         return nnx.Partitioned(value, param_shard)
       else:
-        return value # only when all axis are replicated 
+        return value # type: ignore -- only when all axis are replicated 
     else:
       return p
   
@@ -545,22 +545,73 @@ def test_train():
   )
   _, metric_shapes = jax.eval_shape(train_step_fsdp_fn, state_fsdp, None, batch)
   metrics_fsdp = jax.tree_util.tree_map(lambda x: jnp.zeros(x.shape, dtype=x.dtype), metric_shapes)
-  for _ in range(100):
+  for idx in range(200):
     state_fsdp, metrics_fsdp = train_step_fsdp_fn(state_fsdp, metrics_fsdp, batch)
-    print(f"Iteration {_}")
-    pprint(metrics_fsdp, indent=1)
-  # deltas = jax.tree_util.tree_map(lambda a, b: jnp.linalg.norm(a - b), old_prams, state-fsdp.params)
-  final_metrics_fsdp = jax.tree_util.tree_map(lambda x: jnp.zeros(x.shape, dtype=x.dtype), metrics_fsdp)
-  state_fsdp, final_metrics_fsdp = train_step_fsdp_fn(state_fsdp, final_metrics_fsdp, batch)
+    if idx % 50 == 0: 
+      print(f"Iteration {idx}")
+      pprint(metrics_fsdp, indent=1)
+      pprint({key: num / denom for key, (num, denom) in metrics_fsdp.items()})
+  # final_metrics_fsdp = jax.tree_util.tree_map(lambda x: jnp.zeros(x.shape, dtype=x.dtype), metrics_fsdp)
+  state_fsdp, final_metrics_fsdp = train_step_fsdp_fn(state_fsdp, metrics_fsdp, batch)
   print("FSDP - Final metrics")
   print(final_metrics_fsdp)
+  pprint({key: num / denom for key, (num, denom) in final_metrics_fsdp.items()})
+  # Save checkpoints
+  save_model_state(state_fsdp)
+
+  # TODO: do inference over a prompt
+
+
+# Encoding + Decoding
+from pathlib import Path
+import orbax.checkpoint as ocp
+import tiktoken 
+
+def save_model_state(state: TrainState, path: str= "./checkpoints"):
+  chkpt_path = Path(path).absolute()
+  checkpointer = ocp.PyTreeCheckpointer()
+  train_state = state.params
+  checkpointer.save(chkpt_path, train_state)
+
+def restore_model_state(model: nnx.Module, path: str= "./checkpoints"):
+  checkpointer = ocp.PyTreeCheckpointer()
+  params = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, model.params)
+  checkpointer.restore(Path(path).absolute(), params)
+  return params
+
+def encode_prompt(prompt: str, model_name: str = "gpt2"):
+  tokenizer = tiktoken.get_encoding(model_name)
+  print(f"Encoding: {prompt}")
+  return tokenizer, tokenizer.encode(prompt) 
+
+def sample_from_top_k(rng: jax.Array, logits: jax.Array, k: int = 20) -> jax.Array:
+  logits, indices = jax.lax.top_k(logits, k)
+  logits = jax.nn.softmax(logits, axis=-1)
+  return jax.random.choice(rng, indices, p=logits)
+
+# def generate_text(
+#     model: nnx.Module, 
+#     params: Pytree,
+#     seq_len: int,
+#     rng: jax.Array,
+#     max_num_tokens: int,
+#     start_tokens: list[int],
+#     tokenizer: tiktoken.Encoding
+# ) -> str:
+#   generated = []
+#   for idx in range(max_num_tokens):
+#     sample_index = len(start_tokens) + len(generated) - 1
+#     pad = [0] * (seq_len - len(start_tokens) - len(generated))
+#     padded_tokens = jnp.array(start_tokens + generated + pad)[None, :]
+#     # next_logits, _ = model.apply({"params": params}, padded_tokens)
+#     next_logits = model(padded_tokens)
+#     next_token = sample_from_top_k(rng, next_logits[0][idx])
+#     if next_token == tokenizer.encode('<|endoftext|>', allowed_special={'<|endoftext|>'})[0]:
+#       break
+#     generated.append(next_token)
+#     print(tokenizer.decode(start_tokens + generated), flush=True, end="")
   
-
-
-
-def count_params(params: Any) -> int:
-  prms = jax.tree_util.tree_map(lambda a: a.size if isinstance(a, jax.Array) else 0, params)
-  return jax.tree_util.tree_reduce(lambda a, b: a + b, prms)
+#   return tokenizer.decode(start_tokens + generated)
 
 
 if __name__ == "__main__":
