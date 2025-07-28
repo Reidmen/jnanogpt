@@ -2,6 +2,7 @@ import os
 
 import numpy
 
+
 def set_xla_flags_gpu():
   flags = os.environ.get("XLA_FLAGS", "")
   flags += (
@@ -49,22 +50,24 @@ import dataclasses
 Pytree = Any
 Metrics = dict[str, tuple[jax.Array, ...]]
 
-def create_named_sharding(mesh, args: tuple[str | None,...]):
+
+def create_named_sharding(mesh, args: tuple[str | None, ...]):
   return NamedSharding(mesh, PartitionSpec(args))
 
 
 ## Model
 ###  Configs
-static_compatible_dataclass = lambda cls: tree_util.register_static(dataclasses.dataclass(cls)) # type: ignore
+static_compatible_dataclass = lambda cls: tree_util.register_static(dataclasses.dataclass(cls))  # type: ignore
+
 
 @static_compatible_dataclass
 class ModelConfig:
-  embed_size: int = 128 # 758
+  embed_size: int = 128  # 758
   hidden_size: int = 256  # 1024
   dropout_rate: float = 0.1
   mlp_expansion: int = 4
   num_layers: int = 12
-  head_dim: int = 32 # 128
+  head_dim: int = 32  # 128
   vocab_size: int = 512
   causal_mask: bool = True
   batch_size: int = 16
@@ -87,11 +90,12 @@ class CosineDecayConfig:
   decay_steps: int = 150000
   end_value: float = 1e-5
 
+
 @static_compatible_dataclass
 class TrainConfig:
   learning_date: float = 4e-4
   num_minibatches: int = 4
-  grad_clip: float = 1.0 
+  grad_clip: float = 1.0
   gradient_accumulation_steps: int = 1000
   cosine_decay_config: CosineDecayConfig = dataclasses.field(default_factory=CosineDecayConfig)
 
@@ -208,6 +212,7 @@ def dot_product_attention(
   # attn_ret = attn_ret.astype(v.dtype)
   return attn_ret
 
+
 class AttentionBlock(nnx.Module):
   cfg: ModelConfig
 
@@ -232,8 +237,7 @@ class MLP(nnx.Module):
   @nnx.compact
   def __call__(self, x: jax.Array):
     hidden_dim = x.shape[-1]
-    x = nnx.Dense(
-      features=self.cfg.mlp_expansion * hidden_dim, dtype=self.cfg.dtype, name="c_fc")(x)
+    x = nnx.Dense(features=self.cfg.mlp_expansion * hidden_dim, dtype=self.cfg.dtype, name="c_fc")(x)
     x = nnx.gelu(x, approximate=True)
     x = nnx.Dense(features=hidden_dim, dtype=self.cfg.dtype, name="c_proj")(x)
     x = nnx.Dropout(rate=self.cfg.dropout_rate, deterministic=not self.cfg.train)(x)
@@ -248,7 +252,7 @@ class TransformerBlock(nnx.Module):
     residual = x  # (batch_size, seq_len, hidden_dim)
     # Attention block
     x = nnx.LayerNorm(epsilon=self.cfg.epsilon, dtype=self.cfg.dtype)(x)
-    attn_block = AttentionBlock 
+    attn_block = AttentionBlock
     if "Attn" in self.cfg.remat:
       attn_block = nnx.remat(attn_block, prevent_cse=False)
     x = attn_block(self.cfg, name="attn")(x, mask)
@@ -267,7 +271,7 @@ class GPTModel(nnx.Module):
   @nnx.compact
   def __call__(self, idx: jax.Array) -> jax.Array:
     _, seq_len = idx.shape
-    position = jnp.arange(0, seq_len)[None, :] # (1, seq_len)
+    position = jnp.arange(0, seq_len)[None, :]  # (1, seq_len)
     attn_mask = nnx.make_causal_mask(idx, dtype=bool)
     pos_embed = nnx.Embed(
       num_embeddings=self.cfg.vocab_size, features=self.cfg.embed_size, dtype=self.cfg.dtype, name="pos_embed"
@@ -280,20 +284,20 @@ class GPTModel(nnx.Module):
     # TODO: nnx.scan
     for i in range(self.cfg.num_layers):
       x = TransformerBlock(self.cfg, name=f"block_{i}")(x, attn_mask)
-    x = nnx.LayerNorm(
-      self.cfg.epsilon, dtype=self.cfg.dtype, name="ln_f"
-    )(x)
+    x = nnx.LayerNorm(self.cfg.epsilon, dtype=self.cfg.dtype, name="ln_f")(x)
     logits = wte.attend(x).astype(self.cfg.dtype)
     return logits
 
+
 ## Train
+
 
 def train_step(state: TrainState, tokens: jax.Array, dropout_key: jax.random.PRNGKey) -> tuple[jax.Array, TrainState]:
   # dropout_key = jax.random.fold_in(dropout_key, state.step)
 
   def _loss(params: flax.core.FrozenDict) -> jax.Array:
     X, Y = tokens[:, :-1], tokens[:, 1:]
-    logits = state.apply_fn(params, X, rngs={'dropout': dropout_key})
+    logits = state.apply_fn(params, X, rngs={"dropout": dropout_key})
     loss = optax.softmax_cross_entropy_with_integer_labels(logits, Y).mean()
     return loss
 
@@ -304,7 +308,7 @@ def train_step(state: TrainState, tokens: jax.Array, dropout_key: jax.random.PRN
   return loss, new_state
 
 
-def eval_step(state: TrainState, tokens: jnp.ndarray) ->jax.Array: 
+def eval_step(state: TrainState, tokens: jnp.ndarray) -> jax.Array:
   X, Y = tokens[:, :-1], tokens[:, 1:]
   logits = state.apply_fn(state.params, X, True)
   loss = optax.softmax_cross_entropy_with_integer_labels(logits, Y)
@@ -334,12 +338,11 @@ def init_train_state(
   return train_state
 
 
-
 # TODO, decouple the optimization section: check: train_jgpt_fsdp.py
 def test_model():
   key = jax.random.PRNGKey(64)
   rng, input_rng, dropout_rng = jax.random.split(key, 3)
-  cfg = ModelConfig(vocab_size=256, num_layers=4, embed_size=128, train=False) # type: ignore
+  cfg = ModelConfig(vocab_size=256, num_layers=4, embed_size=128, train=False)  # type: ignore
   model = GPTModel(cfg=cfg)
   batch_size, seq_len = 8, 32
   init_input = jax.random.randint(input_rng, (batch_size, seq_len), minval=0, maxval=cfg.vocab_size)
@@ -353,7 +356,7 @@ def test_model():
 
 
 def test_train():
-  cfg = ModelConfig(vocab_size=256, num_layers=4, embed_size=32, train=True) # type: ignore
+  cfg = ModelConfig(vocab_size=256, num_layers=4, embed_size=32, train=True)  # type: ignore
   init_rng = jax.random.PRNGKey(32)
   rng, input_rng = jax.random.split(init_rng, 2)
   model = GPTModel(cfg=cfg)
@@ -366,7 +369,6 @@ def test_train():
   loss, train_state = jax.jit(train_step)(train_state, init_tokens, key_dropout)
   assert train_state.step == 1
   assert loss.shape == ()
-
 
 
 def count_params(params: Any) -> int:
