@@ -1,6 +1,8 @@
 from functools import partial
 import os
 
+import flax.training.orbax_utils
+
 
 def set_xla_flags_gpu():
   flags = os.environ.get("XLA_FLAGS", "")
@@ -76,10 +78,8 @@ class ModelConfig:
   batch_size: int = 16
   seq_len: int = 32
   max_seq_len: int = 64
-  num_outputs: int = 512  # 2048
   epsilon: float = 1e-6
   dtype: jnp.dtype = jnp.bfloat16
-  softmax_dtype: jnp.dtype = jnp.float32
   scan_layers: bool = False
   train: bool = False
   min_weight_size: int = 2**7
@@ -230,7 +230,7 @@ class AttentionBlock(nnx.Module):
     qkv = dense_module(features=3 * hidden_size, dtype=self.cfg.dtype, name="c_attn")(x)
     qkv = qkv.reshape(batch_size, seq_len, 3 * num_heads, self.cfg.head_dim)
     q, k, v = jnp.array_split(qkv, indices_or_sections=3, axis=2)  # (batch_size, seq_len, num_heads, head_dim)
-    attn = jax.nn.dot_product_attention(q, k, v, bias=None)  # add mask
+    attn = jax.nn.dot_product_attention(q, k, v, bias=None, mask=mask)
     attn = attn.reshape((batch_size, seq_len, hidden_size))
     x = dense_module(features=self.cfg.embed_size, dtype=self.cfg.dtype, name="c_proj")(attn)
     x = nnx.Dropout(rate=self.cfg.dropout_rate, deterministic=not self.cfg.train)(x)
@@ -290,7 +290,7 @@ class GPTModel(nnx.Module):
     tok_embed = wte(idx)  # (batch_size, seq_len, num_embed)
     x = nnx.Dropout(rate=self.cfg.dropout_rate, deterministic=not self.cfg.train)(tok_embed + pos_embed)
     # TODO: nnx.scan
-    attn_mask = nnx.make_causal_mask(x, dtype=jnp.bool)
+    attn_mask = nnx.make_causal_mask(idx, dtype=jnp.bool) # (batch_size, 1, seq_len, seq_len) - MHA
     for i in range(self.cfg.num_layers):
       x = TransformerBlock(self.cfg, name=f"block_{i}")(x, attn_mask)
     x = nnx.LayerNorm(self.cfg.epsilon, dtype=self.cfg.dtype, name="ln_f")(x)
@@ -586,7 +586,7 @@ def test_inference():
     model=ModelConfig(vocab_size=128, num_layers=4, embed_size=64, train=False),  # type: ignore
     train=TrainConfig(),  # type: ignore
   )
-  batch_size, seq_len = 16, 32
+  batch_size, seq_len = cfg.model.batch_size, cfg.model.seq_len
   init_inputs = jax.random.randint(input_rng, (batch_size, seq_len), minval=0, maxval=cfg.model.vocab_size)
   batch = Batch(
     inputs=init_inputs,  # type: ignore
@@ -632,26 +632,29 @@ def test_inference():
       check_vma=True,
     )
   )
+  params_ckpt = restore_model_state(params_template=params_fsdp)
   logits = inference_fn(params_fsdp, batch.inputs)
   print("Logits shape:", logits.shape)
   prompt = "This is a language for"
   tokenizer, encoded_prompt = encode_prompt(prompt, "gpt2")
   print(f"{prompt=}\n{encoded_prompt=}")
+  generate_text_fn = partial(generate_text, cfg=cfg)
+  response = generate_text_fn(inference_fn, params_fsdp, encoded_prompt, tokenizer)
+  print(response)
 
 
 # Encoding + Decoding
 def save_model_state(state: TrainState, path: str = "./checkpoints"):
-  chkpt_path = Path(path).absolute()
   checkpointer = ocp.PyTreeCheckpointer()
-  train_state = state.params
-  checkpointer.save(chkpt_path, train_state)
+  state_params = state.params
+  save_args = flax.training.orbax_utils.save_args_from_target(state_params)
+  checkpointer.save(Path(path).absolute(), state_params, save_args=save_args)
 
 
-def restore_model_state(model: nnx.Module, path: str = "./checkpoints"):
+def restore_model_state(params_template: Pytree, path: str = "./checkpoints") -> Pytree:
   checkpointer = ocp.PyTreeCheckpointer()
-  params = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, model.params)
-  checkpointer.restore(Path(path).absolute(), params)
-  return params
+  params = checkpointer.restore(Path(path).absolute(), item=params_template)
+  return params 
 
 
 def encode_prompt(prompt: str, model_name: str = "gpt2"):
@@ -665,29 +668,35 @@ def sample_from_top_k(rng: jax.Array, logits: jax.Array, k: int = 20) -> jax.Arr
   return jax.random.choice(rng, indices, p=logits)
 
 
-# def generate_text(
-#     model: nnx.Module,
-#     params: Pytree,
-#     seq_len: int,
-#     rng: jax.Array,
-#     max_num_tokens: int,
-#     start_tokens: list[int],
-#     tokenizer: tiktoken.Encoding
-# ) -> str:
-#   generated = []
-#   for idx in range(max_num_tokens):
-#     sample_index = len(start_tokens) + len(generated) - 1
-#     pad = [0] * (seq_len - len(start_tokens) - len(generated))
-#     padded_tokens = jnp.array(start_tokens + generated + pad)[None, :]
-#     # next_logits, _ = model.apply({"params": params}, padded_tokens)
-#     next_logits = model(padded_tokens)
-#     next_token = sample_from_top_k(rng, next_logits[0][idx])
-#     if next_token == tokenizer.encode('<|endoftext|>', allowed_special={'<|endoftext|>'})[0]:
-#       break
-#     generated.append(next_token)
-#     print(tokenizer.decode(start_tokens + generated), flush=True, end="")
+def generate_text(
+    inference_fn: Callable,
+    params: Pytree,
+    start_tokens: list[int],
+    tokenizer: tiktoken.Encoding,
+    cfg: Config,
+    max_num_tokens: int = 32 
+) -> str:
+  generated = []
+  eot = tokenizer.encode('<|endoftext|>', allowed_special={'<|endoftext|>'})[0] 
+  batch_size, seq_len = cfg.model.batch_size, cfg.model.seq_len
+  rng = jax.random.PRNGKey(cfg.seed)
+  for idx in range(max_num_tokens):
+    current_tokens = start_tokens + generated
+    sample_index = len(current_tokens) - 1
+    if sample_index >= seq_len:
+      break
+    pad_amount= [0] * (seq_len - len(current_tokens))
+    padded_tokens = jnp.array(current_tokens + pad_amount)[None, :]
+    batch = jnp.broadcast_to(padded_tokens, (batch_size, seq_len))
+    next_logits = inference_fn(params, batch) # (batch_size, seq_len, embed_size)
+    rng, sample_rng = jax.random.split(rng)
+    next_token = sample_from_top_k(sample_rng, next_logits[0][sample_index])
+    if next_token == eot:
+      break
+    generated.append(next_token)
+    print(tokenizer.decode(start_tokens + generated), flush=True, end="")
 
-#   return tokenizer.decode(start_tokens + generated)
+  return tokenizer.decode(start_tokens + generated)
 
 
 if __name__ == "__main__":
