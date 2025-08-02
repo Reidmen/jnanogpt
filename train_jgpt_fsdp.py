@@ -67,7 +67,7 @@ static_compatible_dataclass = lambda cls: tree_util.register_static(dataclasses.
 
 @static_compatible_dataclass
 class ModelConfig:
-  embed_size: int = 128  # 758
+  embed_size: int = 128  # Match the hidden size
   hidden_size: int = 256  # 1024
   dropout_rate: float = 0.1
   mlp_expansion: int = 4
@@ -98,6 +98,7 @@ class CosineDecayConfig:
 
 @static_compatible_dataclass
 class TrainConfig:
+  train_steps: int = 500
   learning_date: float = 1e-3  # 4e-4
   num_minibatches: int = 2
   grad_clip: float = 1.0
@@ -247,7 +248,7 @@ class MLP(nnx.Module):
       nnx.Dense, axis_name=self.cfg.data_axis_name, min_weight_size=self.cfg.min_weight_size
     )
     x = dense_module(features=self.cfg.mlp_expansion * hidden_size, dtype=self.cfg.dtype, name="c_fc")(x)
-    x = nnx.gelu(x, approximate=True)
+    x = nnx.gelu(x, approximate=True) # TODO  x = nnx.silu(x1) * x2
     x = dense_module(features=self.cfg.embed_size, dtype=self.cfg.dtype, name="c_proj")(x)
     x = nnx.Dropout(rate=self.cfg.dropout_rate, deterministic=not self.cfg.train)(x)
     return x
@@ -282,8 +283,8 @@ class GPTModel(nnx.Module):
     _, seq_len = idx.shape
     position = jnp.arange(0, seq_len)[None, :]  # (1, seq_len)
     pos_embed = nnx.Embed(
-      num_embeddings=self.cfg.vocab_size, features=self.cfg.embed_size, dtype=self.cfg.dtype, name="pos_embed"
-    )(position)  # (vocab_size, embed_dim) (1, seq_len) -> (1, seq_len, num_embed)
+      num_embeddings=self.cfg.max_seq_len, features=self.cfg.embed_size, dtype=self.cfg.dtype, name="pos_embed"
+    )(position)  # (max_seq_len, embed_dim) (1, seq_len) -> (1, seq_len, num_embed)
     wte = nnx.Embed(
       num_embeddings=self.cfg.vocab_size, features=self.cfg.embed_size, dtype=self.cfg.dtype, name="tie_embed"
     )  # (vocab_size, embed_dim)
@@ -442,7 +443,7 @@ def contruct_optimizer(cfg: TrainConfig):
   learning_rate = optax.warmup_cosine_decay_schedule(**dataclasses.asdict(cfg.cosine_decay_config))  # type: ignore
   optimizer = optax.chain(
     optax.clip_by_global_norm(cfg.grad_clip),
-    optax.adamw(learning_rate),
+    optax.contrib.muon(learning_rate),
     optax.apply_every(cfg.gradient_accumulation_steps),
   )
   return optimizer
@@ -504,7 +505,11 @@ def test_train():
     model=ModelConfig(vocab_size=128, num_layers=4, embed_size=64, train=True),  # type: ignore
     train=TrainConfig(),  # type: ignore
   )
-  gpt_model = GPTModel(cfg=cfg.model)
+  # Full sharding via shard_module_params
+  model_shard_module = shard_module_params(
+      GPTModel, axis_name=cfg.model.data_axis_name, min_weight_size=cfg.model.min_weight_size
+    )
+  gpt_model = model_shard_module(cfg=cfg.model)
   batch_size, seq_len = 16, 32
   init_inputs = jax.random.randint(input_rng, (batch_size, seq_len), minval=0, maxval=cfg.model.vocab_size)
   batch = Batch(
@@ -557,19 +562,20 @@ def test_train():
   )
   _, metric_shapes = jax.eval_shape(train_step_fsdp_fn, state_fsdp, None, batch)
   metrics_fsdp = jax.tree_util.tree_map(lambda x: jnp.zeros(x.shape, dtype=x.dtype), metric_shapes)
-  for idx in range(200):
+  for idx in range(cfg.train.train_steps):
     state_fsdp, metrics_fsdp = train_step_fsdp_fn(state_fsdp, metrics_fsdp, batch)
+    avg_metrics = {key: num / denom for key, (num, denom) in metrics_fsdp.items()}
     if idx % 50 == 0:
       print(f"Iteration {idx}")
-      pprint(metrics_fsdp, indent=1)
-      pprint({key: num / denom for key, (num, denom) in metrics_fsdp.items()})
+      # pprint(metrics_fsdp, indent=1)
+      pprint(avg_metrics, indent=1, width=120)
   # final_metrics_fsdp = jax.tree_util.tree_map(lambda x: jnp.zeros(x.shape, dtype=x.dtype), metrics_fsdp)
   state_fsdp, final_metrics_fsdp = train_step_fsdp_fn(state_fsdp, metrics_fsdp, batch)
   print("FSDP - Final metrics")
   print(final_metrics_fsdp)
   pprint({key: num / denom for key, (num, denom) in final_metrics_fsdp.items()})
   # Save checkpoints
-  # save_model_state(state_fsdp)
+  save_model_state(state_fsdp)
 
 
 def init_params(rng: jax.Array, input: jax.Array, model: nnx.Module) -> Pytree:
@@ -593,7 +599,10 @@ def test_inference():
     labels=jnp.pad(init_inputs[:, :-1], ((0, 0), (1, 0))),  # type: ignore
   )
   mesh = jax.make_mesh((8,), axis_names=(cfg.model.data_axis_name,))
-  gpt_model = GPTModel(cfg=cfg.model)
+  model_shard_module = shard_module_params(
+      GPTModel, axis_name=cfg.model.data_axis_name, min_weight_size=cfg.model.min_weight_size
+    )
+  gpt_model = model_shard_module(cfg=cfg.model) # GPTModel will not shard fully
   init_params_fn = jax.shard_map(
     partial(init_params, model=gpt_model),
     in_specs=(PartitionSpec(), PartitionSpec(cfg.model.data_axis_name)),
@@ -617,9 +626,12 @@ def test_inference():
   pprint(jax.tree_util.tree_map(lambda x: x.shape, jax.device_get(params_fsdp)))
 
   def run_inference(params, inputs):
-    InferenceModel = nnx.map_variables(
-      GPTModel, trans_in_fn=partial(gather_params, axis_name=cfg.model.data_axis_name), mapped_collections="params"
+    model_shard_module = shard_module_params(
+      GPTModel, axis_name=cfg.model.data_axis_name, min_weight_size=cfg.model.min_weight_size
     )
+    InferenceModel = nnx.map_variables(
+      model_shard_module, trans_in_fn=partial(gather_params, axis_name=cfg.model.data_axis_name), mapped_collections="params"
+    ) # Full sharding must replace GPTModel by shard_module_params(GPTModel...)
     inference_instance = InferenceModel(cfg=cfg.model)
     return inference_instance.apply({"params": params}, inputs)
 
@@ -633,15 +645,14 @@ def test_inference():
     )
   )
   params_ckpt = restore_model_state(params_template=params_fsdp)
-  logits = inference_fn(params_fsdp, batch.inputs)
+  logits = inference_fn(params_ckpt, batch.inputs)
   print("Logits shape:", logits.shape)
-  prompt = "This is a language for"
+  prompt = "Once upon a time"
   tokenizer, encoded_prompt = encode_prompt(prompt, "gpt2")
-  print(f"{prompt=}\n{encoded_prompt=}")
+  print(f"{prompt=}\n{encoded_prompt=}\nGenerating text....")
   generate_text_fn = partial(generate_text, cfg=cfg)
-  response = generate_text_fn(inference_fn, params_fsdp, encoded_prompt, tokenizer)
-  print(response)
-
+  response = generate_text_fn(inference_fn, params_ckpt, encoded_prompt, tokenizer)
+  print(f"Final completion:\n{response}")
 
 # Encoding + Decoding
 def save_model_state(state: TrainState, path: str = "./checkpoints"):
@@ -680,7 +691,7 @@ def generate_text(
   eot = tokenizer.encode('<|endoftext|>', allowed_special={'<|endoftext|>'})[0] 
   batch_size, seq_len = cfg.model.batch_size, cfg.model.seq_len
   rng = jax.random.PRNGKey(cfg.seed)
-  for idx in range(max_num_tokens):
+  for _ in range(max_num_tokens):
     current_tokens = start_tokens + generated
     sample_index = len(current_tokens) - 1
     if sample_index >= seq_len:
@@ -694,12 +705,12 @@ def generate_text(
     if next_token == eot:
       break
     generated.append(next_token)
-    print(tokenizer.decode(start_tokens + generated), flush=True, end="")
+    print(f"\r{tokenizer.decode(start_tokens + generated)}", end="\n", flush=True)
 
   return tokenizer.decode(start_tokens + generated)
 
 
 if __name__ == "__main__":
   # test_model()
-  # test_train()
+  test_train()
   test_inference()
