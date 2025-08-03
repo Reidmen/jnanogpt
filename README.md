@@ -2,7 +2,7 @@
 
 This repository is inspired by [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt). It aims at pretraining a GPT2-style model with Jax instead of Pytorch (that's the reason of the prefix `j`). *I would call it a speedrun for j-training*. 
 
-Long-term: Search for a fast algorithm to use 8 v5 TPUs or NVIDIA H100 GPUs to train a GPT2-style language model that attains 3.28 cross-entropy loss on the [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) validation set.
+> Long-term: Search for a fast algorithm to use 8 v5 TPUs or NVIDIA H100 GPUs to train a GPT2-style language model that attains 3.28 cross-entropy loss on the [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) validation set.
 
 The target (3.28 validation loss on FineWeb) follows Andrej Karpathy's [GPT-2 replication in llm.c, trained for 45 minutes](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 
@@ -93,8 +93,6 @@ flowchart TD
         PosEmbed --> AddPos
     end
 
-    AddPos --> LN0["Layer Norm<br/>(B, T, C)"]
-
     subgraph Block["Transformer Block × N"]
         direction TB
 
@@ -105,29 +103,30 @@ flowchart TD
         SDPA["Scaled Dot-Product Attention<br/>(B, T, C/h) × h"]
         ConcatHeads["Concat Heads<br/>(B, T, C)"]
         LinearProj["Linear<br/>(B, T, C)"]
-        Residual1["Residual Connection"]
+        Residual1["Residual Connection (Add)"]
 
         %% MLP
-        LN2["Layer Norm<br/>(B, T, C)"]
+        %% LN2["Layer Norm<br/>(B, T, C)"]
         FF["Feed Forward<br/>GELU + Linear<br/>(B, T, C)"]
-        Residual2["Residual Connection"]
+        Residual2["Residual Connection (Add)"]
 
-        LN0 --> LN1
+        %% Full Transformer block
+        AddPos --> LN1
         LN1 --> LinearQKV
         LinearQKV --> SplitHeads
         SplitHeads --> SDPA
         SDPA --> ConcatHeads
         ConcatHeads --> LinearProj
         LinearProj --> Residual1
-        LN1 --> Residual1
-        Residual1 --> LN2
-        LN2 --> FF
+        Residual1 --> FF
         FF --> Residual2
-        LN2 --> Residual2
+        Residual1 --> Residual2
+
+        AddPos --> Residual1
     end
 
     Residual2 --> FinalLN["Layer Norm<br/>(B, T, C)"]
-    FinalLN --> LMHead["Linear Head<br/>(B, T, V)"]
+    FinalLN --> LMHead["Token Tie-Embed <br/>(B, T, V)"]
 
     %% Updated styles for dark mode
     style Embed fill:#581C87,stroke:#C084FC,stroke-width:1.5px,color:#FFFFFF
