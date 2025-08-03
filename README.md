@@ -16,9 +16,9 @@ Key performance improvements to add:
 
 Check the current results here: 
 
-[![Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg) jGPT2-style Partial DP Pretrained](https://www.kaggle.com/code/reidmen/jgpt2) pre-trained fully on v3-8 TPU instances, on 25K steps (~1hr) with sharded parameters for all layers, except the embeddings. 
+[![Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg) jGPT2-style Partial Sharding-DP](https://www.kaggle.com/code/reidmen/jgpt2) pre-trained fully on v3-8 TPU instances, on 25K steps (~1hr) with sharded parameters for all layers, except the embeddings. 
 
-[![Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg) jGPT2-style FSDP Pretrained](https://www.kaggle.com/code/reidmen/jgpt2-fully-sharded) also pre-trained on v3-8 TPU instances, on 45K (~1hr) with full sharding (FSDP). 
+[![Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg) jGPT2-style FSDP](https://www.kaggle.com/code/reidmen/jgpt2-fully-sharded) also pre-trained on v3-8 TPU instances, on 45K (~1hr) with full sharding (FSDP). 
 
 
 ## Loss/Accuracy Logs FSDP
@@ -71,13 +71,18 @@ In the file, several things are done. Here is a brief overview:
 > Looking for collaborations to optimize the code, target `<1000 LOC` that is fast and run in v4, v5 TPU and H100 instances.
 
 ## Model overview
-The model implemented here is a GPT2-style model, i.e. a mix of Embedding layer -> transformer blocks -> Tie-Embedding.
-All of it can be trained and tested in Kaggle resources, which is the initial goal. I would love to test it on H100 or H200 (It's in TODO). 
+The model implemented here is a GPT2-style model, i.e. a mix of `Embedding layer -> Transformer Blocks + MLP -> Tie-Embedding`.
+Total parameter count is slightly over `2M`, for a model with 12 layers, embedding and hidden size of 1024, and 50257 for the vocab size (as the GPT2).
 
-To understand the diagram below, I use the following: 
+> All of it can be trained and tested in Kaggle resources. 
+> The goal is to compare v5-TPU vs. H100 or H200 (It's in TODO). 
+
+To understand the diagram below, I use the following notation: 
 * (B, T, C) — Batch × Sequence × Embedding dim
 * N = Number of transformer blocks
 * h = Number of attention heads
+
+Further details can be seen in the Kaggle links.
 
 ```mermaid
 flowchart TD
