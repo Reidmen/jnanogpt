@@ -1,13 +1,12 @@
 # jNanoGPT
 
-This repository aims at replicating [modded-nangpt](https://github.com/KellerJordan/modded-nanogpt) pre-training with Jax instead of Pytorch. *I would call it a speedrun for j-training*. 
+This repository is inspired by [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt). It aims at pretraining a GPT2-style model with Jax instead of Pytorch (that's the reason of the prefix `j`). *I would call it a speedrun for j-training*. 
 
-The aim is to search for the fastest algorithm to use 8 NVIDIA H100 GPUs to train a language model that attains 3.28 cross-entropy loss on the [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) validation set.
+Long-term: Search for a fast algorithm to use 8 v5 TPUs or NVIDIA H100 GPUs to train a GPT2-style language model that attains 3.28 cross-entropy loss on the [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) validation set.
 
-The target (3.28 validation loss on FineWeb) follows Andrej Karpathy's [GPT-2 replication in llm.c, which attains that loss after running for 45 minutes](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
-The speedrun code also descends from llm.c's [PyTorch trainer](https://github.com/karpathy/llm.c/blob/master/train_gpt2.py), which itself descends from NanoGPT, hence the name of the repo.
+The target (3.28 validation loss on FineWeb) follows Andrej Karpathy's [GPT-2 replication in llm.c, trained for 45 minutes](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 
-Key performance improvements to add:
+Key performance improvements to consider from [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt):
 * Modernized architecture: Rotary embeddings, QK-Norm, and ReLU²
 * The Muon optimizer [[writeup](https://kellerjordan.github.io/posts/muon/)] [[repo](https://github.com/KellerJordan/Muon)]
 * Untie head from embedding, use FP8 matmul for head, and softcap logits (the latter following Gemma 2)
@@ -16,13 +15,13 @@ Key performance improvements to add:
 
 Check the current results here: 
 
-[![Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg) jGPT2-style Partial Sharding-DP](https://www.kaggle.com/code/reidmen/jgpt2) pre-trained fully on v3-8 TPU instances, on 25K steps (~1hr) with sharded parameters for all layers, except the embeddings. 
+[![Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg) jGPT2-style Partial Sharding-DP](https://www.kaggle.com/code/reidmen/jgpt2) pre-trained on v3-8 TPU instances, 25K train steps (~1hr) with sharded parameters for all layers, except the embeddings. 
 
-[![Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg) jGPT2-style FSDP](https://www.kaggle.com/code/reidmen/jgpt2-fully-sharded) also pre-trained on v3-8 TPU instances, on 45K (~1hr) with full sharding (FSDP). 
+[![Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg) jGPT2-style FSDP](https://www.kaggle.com/code/reidmen/jgpt2-fully-sharded) pre-trained on v3-8 TPU instances, 50K train steps (~1hr) with full sharding (FSDP).
 
 
 ## Loss/Accuracy Logs FSDP
-Current pretraining reaches `5.25` in ~50K. This can be done better! Check the [accuracy/loss curves here](https://github.com/Reidmen/jnanogpt/tree/main/images/loss_accuracy_45k.png). 
+Current pretraining over the [OpenWebText](https://www.kaggle.com/datasets/windmaple/openwebtext-gpt2) reaches `5.25` in ~50K steps, using v3-8 TPUs. Check the [accuracy/loss curves here](https://github.com/Reidmen/jnanogpt/tree/main/images/loss_accuracy_45k.png). This can be done better!
 ```
 ...
 4068.7s	731	[2025-08-02 20:12:38.714136] Iteration 49400
@@ -44,7 +43,7 @@ Current pretraining reaches `5.25` in ~50K. This can be done better! Check the [
 - [x] `basics` folder with relevant transformers implementations.
 - [x] include notebook on data parallelism. 
 - [x] JAX version of `ref/train_gpt.py` using FSDP. 
-- [ ] pretraining to reach loss `< 3.2`. Currently FSDP loss at `5.45` using 45K steps.
+- [ ] pretraining to reach loss `< 3.2`. Currently FSDP loss at `5.25` using 45K steps.
 - [ ] Profiling. Ensure good resource utilization, optimizing `batch_size, num_microbatches` and hyperparameter tunning. 
 - [ ] extend to pipeline and tensor parallelism. 
 - [ ] H100 / H200 version + scaling.
@@ -68,11 +67,11 @@ In the file, several things are done. Here is a brief overview:
 > Refer to the fantastic lecture notes [**Training Models at Scale**](https://uvadlc-notebooks.readthedocs.io/en/latest/tutorial_notebooks/scaling/JAX/overview.html) for more details, as I've taken some function definitions from there. 
 
 >[!NOTE]
-> Looking for collaborations to optimize the code, target `<1000 LOC` that is fast and run in v4, v5 TPU and H100 instances.
+> Looking for collaborations to optimize the code, target `<1000 LOC` that is fast and run in v4, v5 TPUs and H100s.
 
 ## Model overview
 The model implemented here is a GPT2-style model, i.e. a mix of `Embedding layer -> Transformer Blocks + MLP -> Tie-Embedding`.
-Total parameter count is slightly over `2M`, for a model with 12 layers, embedding and hidden size of 1024, and 50257 for the vocab size (as the GPT2).
+Total parameter count is slightly over `2M`, for a model with 12 layers, embedding and hidden size of 1024, and 50257 vocab size (same as the GPT2).
 
 > All of it can be trained and tested in Kaggle resources. 
 > The goal is to compare v5-TPU vs. H100 or H200 (It's in TODO). 
