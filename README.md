@@ -125,9 +125,10 @@ flowchart TD
     Residual2 --> FinalLN["Layer Norm<br/>(B, T, C)"]
     FinalLN --> LMHead["Linear Head<br/>(B, T, V)"]
 
-    style Embed fill:#ffe0e0,stroke:#e88,stroke-width:1.5px
-    style Block fill:#e0f7ff,stroke:#00aaff,stroke-width:1.5px
-    style LMHead fill:#fceabb,stroke:#d4a017,stroke-width:1.5px
+    %% Updated styles for dark mode
+    style Embed fill:#581C87,stroke:#C084FC,stroke-width:1.5px,color:#FFFFFF
+    style Block fill:#0E7490,stroke:#22D3EE,stroke-width:1.5px,color:#FFFFFF
+    style LMHead fill:#92400E,stroke:#FACC15,stroke-width:1.5px,color:#FFFFFF
 ```
 
 
@@ -136,84 +137,73 @@ flowchart TD
 The overall module structure can be found below.
 
 ```mermaid
-
 classDiagram
-    %% CONFIGURATION
-    class Config {
-        +model: ModelConfig
-        +train: TrainConfig
-        +seed: int
-    }
 
-    class ModelConfig {
-        <<GPT2-style>>
-    }
+class Config {
+    +model: ModelConfig
+    +train: TrainConfig
+    +seed: int
+}
+class ModelConfig {
+    <<GPT2-style>>
+}
+class TrainConfig {
+    <<Muon Optimizer>>
+}
+class CosineDecayConfig {
+    +learning_rate: float
+    +warmup_steps: int
+}
 
-    class TrainConfig {
-        <<Muon Optimizer>>
-    }
+Config --> ModelConfig
+Config --> TrainConfig
+TrainConfig --> CosineDecayConfig
 
-    class CosineDecayConfig {
-        +learning_rate: float
-        +warmup_steps: int
-    }
+class PartitionedLayer {
+    +sharding_parallelism: FSDP
+}
 
-    Config --> ModelConfig
-    Config --> TrainConfig
-    TrainConfig --> CosineDecayConfig
+class AttentionBlock {
+    +qkv_proj: Partitioned
+    +out_proj: Partitioned
+}
 
-    %% PARALLELISM
-    class Partitioned~Layer~ {
-        +sharding_parallelism: FSDP
-    }
+class MLP {
+    +fc1: Partitioned
+    +fc2: Partitioned
+}
 
-    %% MODEL ARCHITECTURE
-    class AttentionBlock {
-        +qkv_proj: Partitioned
-        +out_proj: Partitioned
-    }
+class TransformerBlock {
+    +attn: AttentionBlock
+    +mlp: MLP
+    +ln1: LayerNorm
+    +ln2: LayerNorm
+}
 
-    class MLP {
-        +fc1: Partitioned
-        +fc2: Partitioned
-    }
+class GPTModel {
+    +token_embed
+    +pos_embed
+    +blocks: TransformerBlock[]
+    +final_ln
+    +lm_head
+}
 
-    class TransformerBlock {
-        +attn: AttentionBlock
-        +mlp: MLP
-        +ln1: LayerNorm
-        +ln2: LayerNorm
-    }
+AttentionBlock --> TransformerBlock
+MLP --> TransformerBlock
+TransformerBlock --> GPTModel
 
-    class GPTModel {
-        +token_embed
-        +pos_embed
-        +blocks: TransformerBlock[]
-        +final_ln
-        +lm_head
-    }
+Partitioned <|-- AttentionBlock
+Partitioned <|-- MLP
 
-    %% COMPOSITION RELATIONSHIPS
-    AttentionBlock --> TransformerBlock
-    MLP --> TransformerBlock
-    TransformerBlock --> GPTModel
+style Config fill:#1E3A8A,stroke:#3B82F6,stroke-width:2px,color:#FFFFFF
+style ModelConfig fill:#1E3A8A,stroke:#3B82F6,color:#FFFFFF
+style TrainConfig fill:#1E3A8A,stroke:#3B82F6,color:#FFFFFF
+style CosineDecayConfig fill:#1E3A8A,stroke:#3B82F6,color:#FFFFFF
 
-    Partitioned <|-- AttentionBlock
-    Partitioned <|-- MLP
+style Partitioned fill:#065F46,stroke:#10B981,stroke-width:2px,color:#FFFFFF
 
-    %% COLOR STYLING
-    %% Config group - Light blue
-    style Config fill:#D0E6FA,stroke:#1A73E8,stroke-width:2px
-    style ModelConfig fill:#D0E6FA,stroke:#1A73E8
-    style TrainConfig fill:#D0E6FA,stroke:#1A73E8
-    style CosineDecayConfig fill:#D0E6FA,stroke:#1A73E8
-
-    %% Parallelism - Light green
-    style Partitioned fill:#D3F9D8,stroke:#34A853,stroke-width:2px
-
-    %% Model blocks - Light yellow
-    style AttentionBlock fill:#FFF4CC,stroke:#FBBC05,stroke-width:2px
-    style MLP fill:#FFF4CC,stroke:#FBBC05
-    style TransformerBlock fill:#FFF4CC,stroke:#FBBC05
-    style GPTModel fill:#FFF4CC,stroke:#FBBC05
+style AttentionBlock fill:#78350F,stroke:#F59E0B,stroke-width:2px,color:#FFFFFF
+style MLP fill:#78350F,stroke:#F59E0B,color:#FFFFFF
+style TransformerBlock fill:#78350F,stroke:#F59E0B,color:#FFFFFF
+style GPTModel fill:#78350F,stroke:#F59E0B,color:#FFFFFF
 ```
