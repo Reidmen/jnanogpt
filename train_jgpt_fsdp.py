@@ -570,10 +570,10 @@ def test_train():
       # pprint(metrics_fsdp, indent=1)
       pprint(avg_metrics, indent=1, width=120)
   # final_metrics_fsdp = jax.tree_util.tree_map(lambda x: jnp.zeros(x.shape, dtype=x.dtype), metrics_fsdp)
-  state_fsdp, final_metrics_fsdp = train_step_fsdp_fn(state_fsdp, metrics_fsdp, batch)
+  # state_fsdp, final_metrics_fsdp = train_step_fsdp_fn(state_fsdp, metrics_fsdp, batch)
   print("FSDP - Final metrics")
-  print(final_metrics_fsdp)
-  pprint({key: num / denom for key, (num, denom) in final_metrics_fsdp.items()})
+  print(metrics_fsdp)
+  pprint({key: num / denom for key, (num, denom) in metrics_fsdp.items()})
   # Save checkpoints
   save_model_state(state_fsdp)
 
