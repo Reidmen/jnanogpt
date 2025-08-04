@@ -15,25 +15,32 @@ Key performance improvements to consider from [modded-nanogpt](https://github.co
 
 Check the current results here: 
 
-[![Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg) jGPT2-style Partial Sharding-DP](https://www.kaggle.com/code/reidmen/jgpt2) pre-trained on v3-8 TPU instances, 25K train steps (~1hr) with sharded parameters for all layers, except the embeddings. 
+[![Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg) GPT2-style Partial Sharding-DP](https://www.kaggle.com/code/reidmen/jgpt2) pre-trained (*higher loss*) on v3-8 TPU instance, 25K train steps with sharded parameters for all layers, except the embeddings. 
 
-[![Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg) jGPT2-style FSDP](https://www.kaggle.com/code/reidmen/jgpt2-fully-sharded) pre-trained on v3-8 TPU instances, 50K train steps (~1hr) with full sharding (FSDP).
+[![Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg) GPT2-style FSDP](https://www.kaggle.com/code/reidmen/jgpt2-fully-sharded) pre-trained (*loss 3.23*) on v3-8 TPU instance, 80K train steps (~2hr) with full sharding (FSDP).
 
 
 ## Loss/Accuracy Logs FSDP
-Current pretraining over the [OpenWebText](https://www.kaggle.com/datasets/windmaple/openwebtext-gpt2) reaches `5.25` in ~50K steps, using v3-8 TPUs. Check the [accuracy/loss curves here](https://github.com/Reidmen/jnanogpt/tree/main/images/loss_accuracy_45k.png). This can be done better!
+Current pretraining on the [OpenWebText](https://www.kaggle.com/datasets/windmaple/openwebtext-gpt2) dataset reaches `3.23` loss in ~80K steps using v3-8 TPUs. Check the [accuracy/loss curves here](https://github.com/Reidmen/jnanogpt/tree/main/images/loss_accuracy_80k.png). This can be done better!
 ```
 ...
-4068.7s	731	[2025-08-02 20:12:38.714136] Iteration 49400
-4068.7s	732	{'accuracy': Array(15.780784, dtype=float32), 'loss': Array(5.3125, dtype=bfloat16)}
-4083.1s	733	[2025-08-02 20:12:53.125201] Iteration 49600
-4083.2s	734	{'accuracy': Array(15.798374, dtype=float32), 'loss': Array(5.28125, dtype=bfloat16)}
-4098.8s	735	[2025-08-02 20:13:08.822760] Iteration 49800
-4098.9s	736	{'accuracy': Array(15.815722, dtype=float32), 'loss': Array(5.25, dtype=bfloat16)}
-4113.5s	737	[2025-08-02 20:13:23.474305] Iteration 50000
-4113.5s	738	{'accuracy': Array(15.832816, dtype=float32), 'loss': Array(5.25, dtype=bfloat16)}
-4122.0s	739	FSDP - Final metrics
-4122.0s	740	{'accuracy': Array(15.832816, dtype=float32), 'loss': Array(5.25, dtype=bfloat16)}
+{'accuracy': Array(18.05004, dtype=float32), 'loss': Array(3.29688, dtype=bfloat16)}
+[2025-08-03 17:50:42.882713] Iteration 79400
+{'accuracy': Array(18.064537, dtype=float32), 'loss': Array(3.29688, dtype=bfloat16)}
+[2025-08-03 17:50:58.489885] Iteration 79600
+{'accuracy': Array(18.079227, dtype=float32), 'loss': Array(3.29688, dtype=bfloat16)}
+[2025-08-03 17:51:12.948886] Iteration 79800
+{'accuracy': Array(18.093573, dtype=float32), 'loss': Array(3.28125, dtype=bfloat16)}
+[2025-08-03 17:51:27.454774] Iteration 80000
+{'accuracy': Array(18.107523, dtype=float32), 'loss': Array(3.28125, dtype=bfloat16)}
+[2025-08-03 17:51:50.886058] Iteration 80200
+{'accuracy': Array(18.12212, dtype=float32), 'loss': Array(3.26562, dtype=bfloat16)}
+[2025-08-03 17:52:05.384090] Iteration 80400
+{'accuracy': Array(18.136295, dtype=float32), 'loss': Array(3.26562, dtype=bfloat16)}
+[2025-08-03 17:52:21.017849] Iteration 80600
+{'accuracy': Array(18.150642, dtype=float32), 'loss': Array(3.26562, dtype=bfloat16)}
+FSDP - Final metrics
+{'accuracy': Array(18.15356, dtype=float32), 'loss': Array(3.23438, dtype=bfloat16)}
 ```
 
 ---
@@ -43,7 +50,7 @@ Current pretraining over the [OpenWebText](https://www.kaggle.com/datasets/windm
 - [x] `basics` folder with relevant transformers implementations.
 - [x] include notebook on data parallelism. 
 - [x] JAX version of `ref/train_gpt.py` using FSDP. 
-- [ ] pretraining to reach loss `< 3.2`. Currently FSDP loss at `5.25` using 45K steps.
+- [x] pretraining to reach loss `< 3.2`.
 - [ ] Profiling. Ensure good resource utilization, optimizing `batch_size, num_microbatches` and hyperparameter tunning. 
 - [ ] extend to pipeline and tensor parallelism. 
 - [ ] H100 / H200 version + scaling.
