@@ -21,7 +21,7 @@ Check the current results here:
 
 
 ## Loss/Accuracy Logs FSDP
-Current pretraining on the [OpenWebText](https://www.kaggle.com/datasets/windmaple/openwebtext-gpt2) dataset reaches `3.23` loss in ~80K steps using v3-8 TPUs. Check the [accuracy/loss curves here](https://github.com/Reidmen/jnanogpt/tree/main/images/loss_accuracy_80k.png). This can be done better!
+Current pretraining on the [OpenWebText](https://www.kaggle.com/datasets/windmaple/openwebtext-gpt2) dataset reaches `3.23` loss in ~80K steps (v3-8 TPUs). Check the [accuracy/loss curves here](https://github.com/Reidmen/jnanogpt/tree/main/images/loss_accuracy_80k.png). This can be done better!
 ```
 ...
 {'accuracy': Array(18.05004, dtype=float32), 'loss': Array(3.29688, dtype=bfloat16)}
@@ -50,7 +50,7 @@ FSDP - Final metrics
 - [x] `basics` folder with relevant transformers implementations.
 - [x] include notebook on data parallelism. 
 - [x] JAX version of `ref/train_gpt.py` using FSDP. 
-- [x] pretraining to reach loss `< 3.2`.
+- [x] pretraining to reach loss `<= 3.2`.
 - [ ] Profiling. Ensure good resource utilization, optimizing `batch_size, num_microbatches` and hyperparameter tunning. 
 - [ ] extend to pipeline and tensor parallelism. 
 - [ ] H100 / H200 version + scaling.
